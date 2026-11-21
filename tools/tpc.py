@@ -1,4 +1,7 @@
-"""Per-query model of sqlglot's TPC-H / TPC-DS executor tests.
+"""Per-item models of sqlglot's heavy loop tests.
+
+Items: the TPC-H / TPC-DS queries of tests/test_executor.py, and the dialects
+of TestGenerator.test_generator_memory (one independent subtest per dialect).
 
 The heavy tests in tests/test_executor.py run every TPC query through sqlglot
 and compare against DuckDB. Each query is independent, so a change that only
@@ -28,6 +31,7 @@ TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tpcds", "execute"),
     "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", "execute"),
     "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", "optimized"),
+    "tests/test_generator.py::TestGenerator::test_generator_memory": ("dialects", "genmem"),
 }
 FIXTURE = {"tpch": "optimizer/tpc-h/tpc-h.sql", "tpcds": "optimizer/tpc-ds/tpc-ds.sql"}
 DATA_DIR = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
@@ -44,9 +48,38 @@ def _schema(ds):
 
 
 def _queries(ds):
+    if ds == "dialects":
+        from sqlglot.dialects import Dialects
+
+        return [({}, d.value, None) for d in Dialects]
     from tests.helpers import load_sql_fixture_pairs
 
     return list(load_sql_fixture_pairs(FIXTURE[ds]))
+
+
+def _genmem(name):
+    """Body of one test_generator_memory subtest (tests/test_generator.py)."""
+    import gc
+    import tracemalloc
+
+    from sqlglot.dialects import Dialect, Dialects
+
+    dialect = Dialect.get_or_raise(Dialects(name))
+    for _ in range(100):
+        dialect.generator()
+    gc.collect()
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        for _ in range(1000):
+            dialect.generator()
+        gc.collect()
+        after = tracemalloc.get_traced_memory()[0]
+    finally:
+        tracemalloc.stop()
+    if not after - before < 1024:
+        raise AssertionError(f"{name}: {after - before} bytes")
+    return {"ok": True}
 
 
 class _Stop(Exception):
@@ -55,27 +88,22 @@ class _Stop(Exception):
 
 
 def plan_digest(plan):
-    """Canonical digest of a planner.Plan: every step attribute and every expression's
-    class, args, type and comments, with steps numbered in a deterministic walk."""
+    """Canonical, content-based digest of a planner.Plan.
+
+    Each step hashes its class, its attributes (expressions by class, args, type and
+    comments) and the sorted hashes of the steps it depends on, so the digest does not
+    depend on object identity or set iteration order. `dependents` is the inverse of
+    `dependencies` and is left out."""
+    import enum
+
     import sqlglot.expressions as exp
     from sqlglot.planner import Step
 
     Expr = getattr(exp, "Expr", None) or exp.Expression
-    ids = {}
-    order = []
-    stack = [plan.root]
-    while stack:
-        st = stack.pop()
-        if id(st) in ids:
-            continue
-        ids[id(st)] = len(order)
-        order.append(st)
-        deps = sorted(st.dependencies, key=lambda d: (str(d.name), type(d).__name__))
-        stack.extend(reversed(deps))
 
     def c(v):
         if isinstance(v, Step):
-            return ("step", ids.get(id(v), -1))
+            return ("step", h(v))
         if isinstance(v, Expr):
             args = tuple((k, c(x)) for k, x in sorted(v.args.items()))
             t = v.__dict__.get("_type")
@@ -88,13 +116,25 @@ def plan_digest(plan):
             return ("l", tuple(c(x) for x in v))
         if isinstance(v, type):
             return ("t", v.__module__, v.__qualname__)
+        if isinstance(v, enum.Enum):
+            return ("n", type(v).__qualname__, v.name)
         if isinstance(v, (str, int, float, bool, type(None))):
-            return ("v", repr(v))
-        return ("o", type(v).__qualname__, repr(sorted(vars(v).items())) if hasattr(v, "__dict__") else repr(v))
+            return ("v", type(v).__name__, repr(v))
+        raise TypeError(f"unexpected value in plan: {type(v).__qualname__}")
 
-    steps = tuple((type(st).__qualname__, tuple((k, c(x)) for k, x in sorted(vars(st).items())))
-                  for st in order)
-    body = (c(plan.expression), c(plan.ctes), steps)
+    memo = {}
+
+    def h(st):
+        k = id(st)
+        if k not in memo:
+            memo[k] = None  # cycle guard (plans are DAGs)
+            attrs = tuple((name, c(x)) for name, x in sorted(vars(st).items()) if name != "dependents")
+            memo[k] = hashlib.sha256(repr((type(st).__qualname__, attrs)).encode()).hexdigest()
+        if memo[k] is None:
+            raise ValueError("cycle in plan")
+        return memo[k]
+
+    body = (h(plan.root), c(plan.expression), c(plan.ctes))
     return hashlib.sha256(repr(body).encode()).hexdigest()
 
 
@@ -110,6 +150,8 @@ def run_one(ds, mode, meta, sql, optimized, tables, compile_only=False, phase=No
 
     phase = phase or (lambda name: None)
     phase("front")
+    if mode == "genmem":
+        return _genmem(sql)
     if mode == "optimized":
         # test_optimized_tpch: DuckDB runs sqlglot's DuckDB SQL for both statements
         return {"a": transpile(sql, write="duckdb")[0], "b": transpile(optimized, write="duckdb")[0]}
@@ -388,14 +430,27 @@ def _setup_task(args):
     M.register_callback(5, M.events.LINE, cb)
     _types = set()
     M.set_events(5, M.events.LINE)
-    tables = load_tables(data_dir, ds, list(_schema(ds)))
-    pickle.loads(pickle.dumps(tables))  # initargs go to the pool workers
-    from tests.helpers import load_sql_fixture_pairs
+    if ds == "dialects":
+        _queries(ds)  # iterating Dialects
+    else:
+        tables = load_tables(data_dir, ds, list(_schema(ds)))
+        pickle.loads(pickle.dumps(tables))  # initargs go to the pool workers
+        from tests.helpers import load_sql_fixture_pairs
 
-    list(load_sql_fixture_pairs(FIXTURE[ds]))
+        list(load_sql_fixture_pairs(FIXTURE[ds]))
     M.set_events(5, 0)
     types, _types = _types, None
-    return ds, ({f: sorted(v) for f, v in lines.items()}, _classes(types))
+    out = {f: set(v) for f, v in lines.items()}
+    if ds == "dialects":
+        # the Dialects enum body decides which subtests exist: changing it needs the real test
+        import ast as _ast
+
+        rel = "sqlglot/dialects/dialect.py"
+        tree = _ast.parse(open(os.path.join(root, rel)).read())
+        for node in tree.body:
+            if isinstance(node, _ast.ClassDef) and node.name == "Dialects":
+                out.setdefault(rel, set()).update(range(node.lineno, node.end_lineno + 1))
+    return ds, ({f: sorted(v) for f, v in out.items()}, [] if ds == "dialects" else _classes(types))
 
 
 def _init(root):
@@ -422,7 +477,7 @@ def profile(root, out_dir):
     with ctx.Pool(4, initializer=_init, initargs=(root,), maxtasksperchild=1) as pool:
         for tid, i, rec in pool.imap_unordered(_trace_task, tasks):
             res[tid]["queries"][i] = rec
-        setup = dict(pool.map(_setup_task, [(root, out_dir, ds) for ds in ("tpch", "tpcds")]))
+        setup = dict(pool.map(_setup_task, [(root, out_dir, ds) for ds in ("tpch", "tpcds", "dialects")]))
     for tid, (ds, _) in TESTS.items():
         res[tid]["setup_lines"], res[tid]["setup_classes"] = setup[ds]
     bad = [(tid, q["err"]) for tid in res for q in res[tid]["queries"] if q["err"]]

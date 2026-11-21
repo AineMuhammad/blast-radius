@@ -38,3 +38,12 @@ Runtime CPU measured in-container on the samples.
 - Samples: **162.551 s** + 3.7 s CPU, 0 misses (3 identical runs).
 - 80 generated mutants: **357.7 s** + 16.7 s CPU, 0 misses (v2: 457.2 s + 5.5 s).
 - Clean build: 3.6 min on 4 cores.
+
+## v4 — per-dialect generator-memory model, deterministic plan digest
+- test_generator_memory modelled per dialect (33 independent subtests); a change reaching
+  some dialects re-runs only those subtests in-container.
+- Plan digest is content-based (Merkle over the step DAG), so it no longer depends on object
+  identity; compile-only TPC-DS checks now confirm harmless optimizer/parser edits.
+- Samples: **142.584 s** + 8.5 s CPU = 151.1 s, 0 misses (3 identical runs).
+- 80 generated mutants: 330.7 s + 21.3 s CPU, 0 misses (v3: 357.7 s + 16.7 s).
+- Clean build: 4.1 min.
