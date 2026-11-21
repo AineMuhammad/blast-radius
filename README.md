@@ -20,7 +20,9 @@ can fail and spread them across up to eight workers.
    source line, the set of tests that a change on that line can affect.
    - Lines inside functions use statement-level coverage.
    - Class-level data (dialect settings, mapping tables, `arg_types`) maps to
-     the tests that use the class, its subclasses, or the dialect that owns it.
+     the tests that use the class, its subclasses, or the dialect that owns it,
+     narrowed to tests that execute code reading the assigned name when that
+     name is never read at import time.
    - Lambdas inside class-level tables map to the tests that call them.
    - Insertions map to the neighbouring statements and the enclosing block.
 
@@ -29,10 +31,14 @@ can fail and spread them across up to eight workers.
 - Parse each diff into changed and inserted line ranges.
 - Ignore hunks that only touch comments or blank lines (outside string literals).
 - Union the precomputed test sets; fixture edits select the tests that read the fixture.
+- If the selection is small and contains only cheap tests, run those tests in
+  the container against the patched sources (forked child, import hook for the
+  changed modules, per-test timeouts) and schedule only the ones that fail.
+  This is a cost decision: local CPU time against the packed schedule.
 - Pack with longest-processing-time first for every worker count from 1 to 8
   and keep the cheapest.
 
-Selector CPU time is under 0.1 s for 30 commits.
+Without local runs the selector uses under 0.1 s of CPU for 30 commits.
 
 ## Layout
 

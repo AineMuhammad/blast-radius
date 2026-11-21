@@ -280,8 +280,29 @@ def select(mp, patch_text, info=None):
 
 # ------------------------------------------------------------ local runs
 SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
-LOCAL_OVERHEAD_MS = 700  # fork + importing sqlglot, the test modules and patched sources
-LOCAL_FACTOR = 1.0  # local CPU per recorded test second
+LOCAL_OVERHEAD_MS = 500  # fork + importing sqlglot, the test modules and patched sources
+LOCAL_FACTOR = 1.4  # local CPU per recorded test second (measured, includes per-test imports)
+LOCAL_P_FAIL = float(os.environ.get("BR_PFAIL", "0.5"))  # chance a locally run selection contains a failure (then little is saved)
+# stdlib modules sqlglot and unittest import: loaded once in the parent, shared by forks
+PRELOAD = ("unittest", "importlib.abc", "importlib.util", "signal", "typing", "re", "enum",
+           "datetime", "decimal", "math", "functools", "itertools", "collections", "logging",
+           "textwrap", "dataclasses", "copy", "inspect", "string", "heapq", "uuid", "hashlib",
+           "contextlib", "abc", "numbers", "fractions", "difflib", "zoneinfo", "random")
+_preloaded = False
+
+
+def _preload():
+    global _preloaded
+    if _preloaded:
+        return
+    _preloaded = True
+    import importlib
+
+    for m in PRELOAD:
+        try:
+            importlib.import_module(m)
+        except Exception:
+            pass
 # classes whose fixtures start process pools / databases: never run locally
 HEAVY_CLASSES = ("tests/test_optimizer.py::", "tests/test_executor.py::", "tests/test_sqlglotc.py::")
 
@@ -324,12 +345,6 @@ def _child_run(patched, test_ids, budgets, wfd):
     os.environ["SKIP_INTEGRATION"] = "0"
     os.chdir(SQLGLOT)
     sys.path.insert(0, SQLGLOT)
-    try:
-        import site
-
-        site.main()
-    except Exception:
-        pass
     mods = {_modname(p): (p, src) for p, src in patched.items()}
 
     class Loader(importlib.abc.SourceLoader):
@@ -509,7 +524,7 @@ def plan_local(nums, ms, idof):
     if not elig:
         return []
     base = pack_cost([ms[n] for n in nums])
-    best, best_k = base, 0
+    best, best_k = 0, 0  # best expected saving
     rest_sorted = sorted((ms[n] for n in nums), reverse=True)
     acc = 0
     elig_set = set()
@@ -519,9 +534,11 @@ def plan_local(nums, ms, idof):
         if k < len(elig) and ms[elig[k]] == ms[n]:
             continue
         remaining = [ms[m] for m in nums if m not in elig_set]
-        c = pack_cost(remaining) + LOCAL_OVERHEAD_MS + LOCAL_FACTOR * acc
-        if c < best - 200:
-            best, best_k = c, k
+        cpu = LOCAL_OVERHEAD_MS + LOCAL_FACTOR * acc
+        # pass: pay cpu + rest; fail: pay cpu and (about) the full schedule
+        saving = (1 - LOCAL_P_FAIL) * (base - pack_cost(remaining)) - cpu
+        if saving > best + 100:
+            best, best_k = saving, k
     return elig[:best_k]
 
 
@@ -562,6 +579,7 @@ def refine_local(info, nums, ms, idof):
         if new is None:
             return nums
         patched[path] = new
+    _preload()
     ids = [idof[n] for n in L]
     budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L}
     wall = 20 + sum(budgets.values())

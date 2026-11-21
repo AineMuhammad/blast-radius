@@ -11,7 +11,13 @@ import subprocess
 import sys
 
 SET, TESTS = sys.argv[1], sys.argv[2]
+SHARD, NSHARDS = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (0, 1)
 ROOT = "/opt/sqlglot"
+if NSHARDS > 1:
+    # private copy of the checkout per shard
+    ROOT = f"/tmp/sqlglot{SHARD}"
+    if not os.path.exists(ROOT):
+        shutil.copytree("/opt/sqlglot", ROOT)
 tests = json.load(open(TESTS))["tests"]
 num = {t["id"]: t["number"] for t in tests}
 by_file = {}
@@ -19,6 +25,9 @@ for t in tests:
     by_file.setdefault(t["file"], []).append(t["number"])
 kinds = json.load(open(os.path.join(SET, "kinds.json")))
 ans_p = os.path.join(SET, "answers.json")
+done = json.load(open(ans_p))["commits"] if os.path.exists(ans_p) else {}
+if NSHARDS > 1:
+    ans_p = os.path.join(SET, f"answers.{SHARD}.json")
 ans = json.load(open(ans_p))["commits"] if os.path.exists(ans_p) else {}
 
 PLUGIN = '''
@@ -39,8 +48,10 @@ def pytest_sessionfinish(session):
     with open(os.environ["LABEL_OUT"] + "." + tag, "w") as f:
         json.dump({"failed": sorted(FAILED), "files": sorted(FILES)}, f)
 '''
-os.makedirs("/tmp/lp", exist_ok=True)
-open("/tmp/lp/label_plugin.py", "w").write(PLUGIN)
+LP = f"/tmp/lp{SHARD}"
+os.makedirs(LP, exist_ok=True)
+open(f"{LP}/label_plugin.py", "w").write(PLUGIN)
+OUTP = f"/tmp/label_out{SHARD}"
 
 
 def apply(path, patch):
@@ -72,8 +83,8 @@ def apply(path, patch):
     return "".join(out)
 
 
-for cid in sorted(kinds):
-    if cid in ans:
+for k, cid in enumerate(sorted(kinds)):
+    if cid in ans or cid in done or k % NSHARDS != SHARD:
         continue
     patch = open(os.path.join(SET, "commits", cid + ".patch")).read()
     path = None
@@ -87,17 +98,18 @@ for cid in sorted(kinds):
         newp = os.path.join(SET, "new", cid)
         open(full, "w").write(open(newp).read() if os.path.exists(newp) else apply(full, patch))
         for f in os.listdir("/tmp"):
-            if f.startswith("label_out"):
+            if f.startswith(os.path.basename(OUTP) + "."):
                 os.remove(os.path.join("/tmp", f))
-        env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{ROOT}:/tmp/lp", LABEL_OUT="/tmp/label_out")
+        env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{ROOT}:{LP}", LABEL_OUT=OUTP)
         subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "label_plugin", "-p", "no:cacheprovider", "-n", "8", "-q",
+            [sys.executable, "-m", "pytest", "-p", "label_plugin", "-p", "no:cacheprovider",
+             "-n", os.environ.get("LABEL_WORKERS", "8"), "-q",
              "--timeout", "300", "tests"],
             cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         failed = set()
         for f in os.listdir("/tmp"):
-            if f.startswith("label_out."):
+            if f.startswith(os.path.basename(OUTP) + "."):
                 d = json.load(open(os.path.join("/tmp", f)))
                 for nid in d["failed"]:
                     if nid in num:
