@@ -158,6 +158,58 @@ def _hex(h):
     return int(h, 16) if h else 0
 
 
+CMP_FILE = os.environ.get("BR_CMP", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmp_equivalent.json"))
+CMP_PARTNER = {("is",): ("==",), ("==",): ("is",), ("is", "not"): ("!=",), ("!=",): ("is", "not"),
+               ("<",): ("<=",), ("<=",): ("<",), (">",): (">=",), (">=",): (">",)}
+_CMP_SITES = None
+
+
+def _cmp_sites():
+    global _CMP_SITES
+    if _CMP_SITES is None:
+        try:
+            with open(CMP_FILE) as f:
+                _CMP_SITES = set(json.load(f)["sites"])
+        except (OSError, ValueError, KeyError):
+            _CMP_SITES = set()
+    return _CMP_SITES
+
+
+def _tokens(line):
+    import io
+    import tokenize
+
+    out = []
+    try:
+        for t in tokenize.generate_tokens(io.StringIO(line + "\n").readline):
+            if t.type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+                          tokenize.ENDMARKER, tokenize.COMMENT):
+                continue
+            out.append((t.string, t.start[1]))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass  # an open bracket at the end of the line: the tokens so far are enough
+    return out
+
+
+def equivalent_compare_edit(path, line_no, old, new):
+    """True if a one-line edit only swaps a comparison operator for its partner at a site
+    where the full suite proved both operators give the same result every time."""
+    if not _cmp_sites():
+        return False
+    a, b = _tokens(old), _tokens(new)
+    i = 0
+    while i < len(a) and i < len(b) and a[i][0] == b[i][0]:
+        i += 1
+    j = 0
+    while j < len(a) - i and j < len(b) - i and a[-1 - j][0] == b[-1 - j][0]:
+        j += 1
+    oa = tuple(t for t, _ in a[i:len(a) - j])
+    ob = tuple(t for t, _ in b[i:len(b) - j])
+    if not oa or CMP_PARTNER.get(oa) != ob:
+        return False
+    return f"{path}:{line_no}:{a[i][1]}" in _cmp_sites()
+
+
 def lambda_body_edit(fm, removed, rem_txt, add_txt):
     """Group of the innermost lambda whose body alone a one-line edit changes, else None."""
     if len(removed) != 1 or len(add_txt) != 1:
@@ -183,7 +235,7 @@ def lambda_body_edit(fm, removed, rem_txt, add_txt):
     return None
 
 
-def select_py(fm, hunks, flags=None):
+def select_py(fm, hunks, flags=None, path=None):
     """flags (dict) gets 'import_time': True when a change touches code that runs on import,
     and 'blocks': the test bits of each change block."""
     bits = 0
@@ -232,6 +284,11 @@ def select_py(fm, hunks, flags=None):
             if flags is not None and (any(l in T for l in removed) or (not removed and (
                     a == 0 or a in T or (a + 1) in T))):
                 flags["import_time"] = True
+            if (path and len(removed) == 1 and len(add_txt) == 1
+                    and equivalent_compare_edit(path, removed[0], rem_txt[0], add_txt[0])):
+                if flags is not None:
+                    flags["equivalent"] = flags.get("equivalent", 0) + 1
+                continue  # proven to behave identically for every test
             rem_code = [l for l in removed if 1 <= l <= nlines and M[l] >= 0]
             bbits = 0
             narrowed = lambda_body_edit(fm, removed, rem_txt, add_txt)
@@ -310,7 +367,7 @@ def select(mp, patch_text, info=None):
                     bits |= _hex(idx["testfile"].get(path))
                 else:
                     flags = {}
-                    bits |= select_py(fm, f["hunks"], flags)
+                    bits |= select_py(fm, f["hunks"], flags, path)
                     if info is not None:
                         info["blocks"].extend(flags.get("blocks", []))
                         if flags.get("import_time"):
@@ -373,6 +430,7 @@ LOCAL_WALL_PER_COMMIT = 2.5
 LOCAL_WALL_MAX = 150.0
 LOCAL_OVERHEAD_MS = 500  # fork, imports, patched sources; deliberately above the measured 0.2 s
 LOCAL_FACTOR = 1.4  # local CPU per recorded test second (measured 1.15; margin pays off)
+LOCAL_FAIL_KEEPS_ONE = os.environ.get("BR_FAIL_KEEPS_ONE", "0") == "1"  # tried: no gain, more CPU
 LOCAL_P_FAIL = float(os.environ.get("BR_PFAIL", "0.5"))  # chance a locally run selection contains a failure (then little is saved)
 # stdlib modules sqlglot and unittest import: loaded once in the parent, shared by forks
 PRELOAD = ("unittest", "importlib.abc", "importlib.util", "signal", "typing", "re", "enum",
@@ -670,7 +728,14 @@ def plan_local(nums, ms, idof, extra_cost=None, extra_fail=None):
         chosen.add(n)
         remaining = [ms[m] for m in nums if m not in chosen]
         cpu = LOCAL_OVERHEAD_MS + (1 - LOCAL_P_FAIL) * acc + LOCAL_P_FAIL * acc_fail
-        saving = (1 - LOCAL_P_FAIL) * (base - pack_cost(remaining)) - cpu
+        if LOCAL_FAIL_KEEPS_ONE:
+            # a run that finds a failure still drops the passing tests: assume it keeps
+            # the most expensive one of the locally run tests
+            worst = max(ms[m] for m in chosen)
+            saving = ((1 - LOCAL_P_FAIL) * (base - pack_cost(remaining))
+                      + LOCAL_P_FAIL * (base - pack_cost(remaining + [worst])) - cpu)
+        else:
+            saving = (1 - LOCAL_P_FAIL) * (base - pack_cost(remaining)) - cpu
         if saving > best + 100:
             best, best_k = saving, k
     return [n for _, n in cand[:best_k]]

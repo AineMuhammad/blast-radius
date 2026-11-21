@@ -173,6 +173,149 @@ def _import_everything():
     _import_types.update(snapshot)
 
 
+# --- comparison probes -------------------------------------------------------
+# Every single comparison in sqlglot is compiled as a probe call on the same line. The
+# probe returns the original result and records, per site, whether swapping the operator
+# for its partner (is/==, is not/!=, </<=, >/>=) would have given the same result at
+# every evaluation seen. A site is keyed by (file, line, column of the operator).
+_CMP = {}  # site -> True (equivalent so far) / False (a difference or an unsafe operand)
+_ORDER_SAFE = (int, float, str, bytes)
+
+
+def _safe_order(v):
+    t = type(v)
+    if t in _ORDER_SAFE or t is bool:
+        return True
+    if t is tuple:
+        return all(type(x) in _ORDER_SAFE or type(x) is bool for x in v)
+    return False
+
+
+def _mark(site, ok):
+    if not ok:
+        _CMP[site] = False
+    elif site not in _CMP:
+        _CMP[site] = True
+
+
+def _p_is(site, a, b):
+    r = a is b
+    if _CMP.get(site) is not False:
+        try:
+            e = a == b
+            _mark(site, type(e) is bool and e == r)
+        except Exception:  # noqa: BLE001
+            _mark(site, False)
+    return r
+
+
+def _p_isnot(site, a, b):
+    r = a is not b
+    if _CMP.get(site) is not False:
+        try:
+            e = a != b
+            _mark(site, type(e) is bool and e == r)
+        except Exception:  # noqa: BLE001
+            _mark(site, False)
+    return r
+
+
+def _p_eq(site, a, b):
+    r = a == b
+    if _CMP.get(site) is not False:
+        _mark(site, type(r) is bool and r == (a is b))
+    return r
+
+
+def _p_ne(site, a, b):
+    r = a != b
+    if _CMP.get(site) is not False:
+        _mark(site, type(r) is bool and r == (a is not b))
+    return r
+
+
+def _order(op):
+    def probe(site, a, b):
+        r = op(a, b)
+        if _CMP.get(site) is not False:
+            try:
+                _mark(site, _safe_order(a) and _safe_order(b) and not (a == b) and type(r) is bool)
+            except Exception:  # noqa: BLE001
+                _mark(site, False)
+        return r
+
+    return probe
+
+
+import operator as _op  # noqa: E402
+
+_PROBES = {"Is": "_p_is", "IsNot": "_p_isnot", "Eq": "_p_eq", "NotEq": "_p_ne",
+           "Lt": "_p_lt", "LtE": "_p_le", "Gt": "_p_gt", "GtE": "_p_ge"}
+
+
+def _install_probes():
+    import ast
+    import builtins
+    import importlib.abc
+    import importlib.machinery
+    import importlib.util
+
+    for name, fn in (("_p_is", _p_is), ("_p_isnot", _p_isnot), ("_p_eq", _p_eq), ("_p_ne", _p_ne),
+                     ("_p_lt", _order(_op.lt)), ("_p_le", _order(_op.le)),
+                     ("_p_gt", _order(_op.gt)), ("_p_ge", _order(_op.ge))):
+        setattr(builtins, "_br" + name, fn)  # single underscore: no class-body mangling
+    base = ROOT + "sqlglot/"
+
+    class Rewrite(ast.NodeTransformer):
+        def __init__(self, rel, lines):
+            self.rel, self.lines = rel, lines
+
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            if len(node.ops) != 1:
+                return node
+            kind = type(node.ops[0]).__name__
+            if kind not in _PROBES:
+                return node
+            left, right = node.left, node.comparators[0]
+            if not (left.end_lineno == right.lineno == node.lineno):
+                return node
+            col = _op_col(self.lines[node.lineno - 1], left.end_col_offset, right.col_offset)
+            if col is None:
+                return node
+            site = f"{self.rel}:{node.lineno}:{col}"
+            call = ast.Call(func=ast.Name(id="_br" + _PROBES[kind], ctx=ast.Load()),
+                            args=[ast.Constant(site), left, right], keywords=[])
+            return ast.copy_location(call, node)
+
+    class Loader(importlib.machinery.SourceFileLoader):
+        def source_to_code(self, data, path, *, _optimize=-1):
+            src = data.decode("utf-8") if isinstance(data, bytes) else data
+            tree = ast.parse(src, path)
+            rel = path[len(ROOT):]
+            tree = ast.fix_missing_locations(Rewrite(rel, src.splitlines()).visit(tree))
+            return compile(tree, path, "exec", dont_inherit=True)
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name != "sqlglot" and not name.startswith("sqlglot."):
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            if spec is None or not spec.origin or not spec.origin.startswith(base) or not spec.origin.endswith(".py"):
+                return spec
+            spec.loader = Loader(name, spec.origin)
+            return spec
+
+    sys.meta_path.insert(0, Finder())
+
+
+def _op_col(line, start, end):
+    """Column of the comparison operator: the first operator text after the left operand."""
+    seg = line[start:end]
+    hits = [seg.find(t) for t in ("is", "==", "!=", "<", ">") if seg.find(t) >= 0]
+    return start + min(hits) if hits else None
+
+
 _installed = False
 _cur_test = None
 
@@ -182,6 +325,8 @@ def _install():
     if _installed:
         return
     _installed = True
+    if os.environ.get("BR_PROBES") == "1":  # offline only: makes the suite ~5x slower
+        _install_probes()
     M.use_tool_id(TOOL, "br_trace")
     M.register_callback(TOOL, M.events.LINE, _line_cb)
     M.register_callback(TOOL, M.events.PY_START, _start_cb)
@@ -217,6 +362,8 @@ def _child_record(test_id, payload):
         os.makedirs(OUT, exist_ok=True)
         with open(os.path.join(OUT, f"child_{os.getpid()}.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
+        with open(os.path.join(OUT, f"cmp_{os.getpid()}.json"), "w") as f:
+            json.dump(_CMP, f)
 
 
 def _child_task(test_id, payload):
@@ -333,6 +480,7 @@ def pytest_unconfigure(config):
                 "tests": _results,
                 "import_lines": {k: sorted(v) for k, v in _import_lines.items()},
                 "import_func_lines": {k: sorted(v) for k, v in _import_func_lines.items()},
+                "cmp": _CMP,
                 "import_types": sorted({_qual(c) for t in _import_types for c in t.__mro__
                                         if c.__module__.startswith("sqlglot")}),
             },

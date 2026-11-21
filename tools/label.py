@@ -87,16 +87,24 @@ for k, cid in enumerate(sorted(kinds)):
     if cid in ans or cid in done or k % NSHARDS != SHARD:
         continue
     patch = open(os.path.join(SET, "commits", cid + ".patch")).read()
-    path = None
-    for ln in patch.splitlines():
-        if ln.startswith("+++ b/"):
-            path = ln[6:]
-            break
-    full = os.path.join(ROOT, path)
-    orig = open(full).read()
-    try:
+    multi = os.path.join(SET, "new", cid + ".json")
+    if os.path.exists(multi):
+        edits = json.load(open(multi))
+    else:
+        path = None
+        for ln in patch.splitlines():
+            if ln.startswith("+++ b/"):
+                path = ln[6:]
+                break
         newp = os.path.join(SET, "new", cid)
-        open(full, "w").write(open(newp).read() if os.path.exists(newp) else apply(full, patch))
+        content = open(newp).read() if os.path.exists(newp) else apply(os.path.join(ROOT, path), patch)
+        edits = [{"path": path, "content": content}]
+    origs = {e["path"]: open(os.path.join(ROOT, e["path"])).read() for e in edits}
+    full = os.path.join(ROOT, edits[0]["path"])
+    orig = origs[edits[0]["path"]]
+    try:
+        for e in edits:
+            open(os.path.join(ROOT, e["path"]), "w").write(e["content"])
         for f in os.listdir("/tmp"):
             if f.startswith(os.path.basename(OUTP) + "."):
                 os.remove(os.path.join("/tmp", f))
@@ -120,7 +128,7 @@ for k, cid in enumerate(sorted(kinds)):
         ans[cid] = {"failing": sorted(failed), "kind": kinds[cid]}
         print(cid, kinds[cid], len(failed), flush=True)
     finally:
-        open(full, "w").write(orig)
-        pyc = os.path.join(os.path.dirname(full), "__pycache__")
-        shutil.rmtree(pyc, ignore_errors=True)
+        for p_, o_ in origs.items():
+            open(os.path.join(ROOT, p_), "w").write(o_)
+            shutil.rmtree(os.path.join(ROOT, os.path.dirname(p_), "__pycache__"), ignore_errors=True)
     json.dump({"commits": ans}, open(ans_p, "w"))

@@ -141,20 +141,26 @@ def mutate_fixture():
 
 
 os.makedirs(os.path.join(OUT, "commits"), exist_ok=True)
+os.makedirs(os.path.join(OUT, "new"), exist_ok=True)
 kinds = {}
+# mix of the 30 samples: ~53% code, 27% fixture, 10% multi-file, 10% comment
 for k in range(COUNT):
     r = rng.random()
-    if r < 0.7:
-        path, old, new, kind = mutate_code()
-    elif r < 0.82:
-        path, old, new, kind = mutate_comment()
+    if r < 0.53:
+        edits = [mutate_code()]
+    elif r < 0.80:
+        edits = [mutate_fixture()]
+    elif r < 0.90:
+        a, b = mutate_code(), mutate_fixture()
+        edits = [a, b] if a[0] != b[0] else [a]
     else:
-        path, old, new, kind = mutate_fixture()
+        edits = [mutate_comment()]
+    kind = "multi" if len(edits) > 1 else edits[0][3]
     cid = f"m{SEED:02d}{k:03d}"
-    d = git_header(path, unified(path, old, new))
+    d = "".join(git_header(p, unified(p, o, n)) for p, o, n, _ in edits)
     open(os.path.join(OUT, "commits", cid + ".patch"), "w").write(d)
-    os.makedirs(os.path.join(OUT, "new"), exist_ok=True)
-    open(os.path.join(OUT, "new", cid), "w").write(new)
+    json.dump([{"path": p, "content": n} for p, o, n, _ in edits],
+              open(os.path.join(OUT, "new", cid + ".json"), "w"))
     kinds[cid] = kind
 json.dump(kinds, open(os.path.join(OUT, "kinds.json"), "w"), indent=0)
 print("wrote", len(kinds))

@@ -73,3 +73,16 @@ Runtime CPU measured in-container on the samples.
   tests that call that lambda (lambdas that run during import are excluded).
 - Gates: edge cases OK; 0 misses on samples, 80 + 48 + 60 labeled mutants.
 - Samples: 121.130 s + 23.0 s CPU (unchanged selection, safer coverage).
+
+## v7 — proven-equivalent comparison edits
+- Offline probe run (tools/br_trace.py, BR_PROBES=1): every single comparison in sqlglot
+  is compiled as a probe on the same line that records, at every evaluation of the full
+  suite, whether the partner operator (is/==, is not/!=, </<=, >/>=) gives the same
+  result (`==` must return a real bool; ordering operands must be plain numbers/strings
+  or tuples of them and never equal). 1,328 of 1,885 evaluated sites are proven.
+  The map is committed (maps/cmp_equivalent.json); the probe run is too slow for the build.
+- At run time a one-line edit that only swaps an operator for its partner at a proven
+  site behaves identically for every test, by induction over the original run, so it
+  selects nothing.
+- Samples: **106.587 s** + 8.4 s CPU = 115.0 s (v6: 144.1 s), 0 misses.
+  Fresh 48: 264.5 s simulated, 0 misses.

@@ -33,5 +33,8 @@ RUN PYTHONPATH=/opt/sqlglot python /build/build_map.py /opt/sqlglot /build/trace
  && rm /app/tpcdata/profile.json \
  && chmod -R a+rX /app
 
+# comparison sites proven equivalent by the probe run (tools/br_trace.py, BR_PROBES=1),
+# committed as a plain map: the probe run is too slow for the build
+COPY maps/cmp_equivalent.json /app/cmp_equivalent.json
 COPY selector.py /app/selector.py
 CMD ["python", "-S", "/app/selector.py"]

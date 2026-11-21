@@ -5,3 +5,4 @@
 !tools/tpc.py
 !tools/opt_model.py
 !selector.py
+!maps/cmp_equivalent.json
