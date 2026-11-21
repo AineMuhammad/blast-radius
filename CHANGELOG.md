@@ -110,3 +110,21 @@ Runtime CPU measured in-container on the samples.
 - Samples 106.587 s; fresh 48: 248.389 s (was 264.502: m02044 drops TPC-DS, CPU-neutral
   there because every plan changed). 0 misses on samples, fresh, 80 random, 150-set so far.
 - Probe branch `probe-no-tpcds` (74603c4): never schedules TPC-DS, for board measurement only.
+
+## v9 — TPC phase fix (soundness), class-attribute reads
+- FIX: the compile-only TPC check treated all of `execute()` before the executor as
+  compile phase, but `execute()` also builds the table mapping the executor reads, which
+  the plan digest does not cover. A change there (150-set m03135: `ensure_tables` returning
+  `{}`) passed the check while test_execute_tpcds failed. Compile phase is now only what
+  runs inside optimize() and Plan(); everything else in execute() needs a full run, and
+  the compile-only check also compares the tables each query hands to execute().
+  Affected v3..v8, including 23e305c.
+- The tracer records reads of UPPERCASE scalar class attributes (non-data descriptor),
+  resolved to the defining class. A class-level assignment of such an attribute selects
+  the tests that read that definition, unless class-creation code reads it, an object of
+  a related class made at import reads it, or any class/module body references the name.
+- Labels: three 150-set commits had spurious failures from timeouts while the machine was
+  overloaded; re-labeled on an idle machine (m03051, m03052, m03053). Rule: every reported
+  miss is re-labeled on an idle machine before it is trusted.
+- Samples 106.391 s + 2.7 s CPU; fresh 248.461 s; 80 random 280.956 s (v8 299.125 s);
+  150-set 666.871 s. 0 misses on all sets; edge cases OK; byte-identical runs.

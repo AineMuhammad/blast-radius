@@ -145,6 +145,59 @@ def _hook_classes():
                     pass
 
 
+# --- class-attribute reads ----------------------------------------------------
+# UPPERCASE scalar class attributes of sqlglot's main classes (dialect settings, tokenizer
+# and generator flags) are wrapped in a non-data descriptor that records which class's
+# definition a read resolved to. Recorded as pseudo coverage "@attr:<class>:<name>" so
+# set-up phases and pool workers are handled like line coverage.
+_WATCHED = set()
+
+
+class _Watch:
+    __slots__ = ("value", "key")
+
+    def __init__(self, value, key):
+        self.value, self.key = value, key
+
+    def __get__(self, obj, owner=None):
+        b = _cur_lines
+        if b is not None:
+            s = b.get(self.key)
+            if s is None:
+                b[self.key] = {0}
+        return self.value
+
+
+_SCALARS = (bool, int, float, str, type(None))
+
+
+def _install_watchers():
+    import sqlglot.expressions as exp
+    from sqlglot import generator, parser, tokens
+    from sqlglot.dialects.dialect import Dialect
+
+    bases = [b for b in (getattr(exp, "Expr", None), getattr(exp, "Expression", None)) if isinstance(b, type)]
+    bases += [Dialect, tokens.Tokenizer, parser.Parser, generator.Generator]
+    seen = set()
+    stack = list(bases)
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        stack.extend(c.__subclasses__())
+        if not c.__module__.startswith("sqlglot"):
+            continue
+        for name, value in list(c.__dict__.items()):
+            if name.isupper() and type(value) in _SCALARS:
+                key = f"@attr:{c.__module__}.{c.__qualname__}:{name}"
+                try:
+                    setattr(c, name, _Watch(value, key))
+                    _WATCHED.add(key)
+                except (AttributeError, TypeError):
+                    pass
+
+
 def _import_everything():
     import sqlglot
 
@@ -337,6 +390,8 @@ def _install():
     _hook_classes()
     _import_everything()
     _hook_classes()  # classes defined by the lazily imported modules
+    if os.environ.get("BR_WATCH", "1") == "1":
+        _install_watchers()
 
 
 def _child_record(test_id, payload):
@@ -481,6 +536,7 @@ def pytest_unconfigure(config):
                 "import_lines": {k: sorted(v) for k, v in _import_lines.items()},
                 "import_func_lines": {k: sorted(v) for k, v in _import_func_lines.items()},
                 "cmp": _CMP,
+                "watched": sorted(_WATCHED),
                 "import_types": sorted({_qual(c) for t in _import_types for c in t.__mro__
                                         if c.__module__.startswith("sqlglot")}),
             },

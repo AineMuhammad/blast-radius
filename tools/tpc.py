@@ -193,34 +193,42 @@ def run_one(ds, mode, meta, sql, optimized, tables, compile_only=False, phase=No
             ex.execute(expression, schema=_schema(ds), tables=needed)
             raise RuntimeError("executor stub not reached")
         except _Stop as stop:
-            return {"duck": duck, "plan": plan_digest(stop.plan)}
+            return {"duck": duck, "plan": plan_digest(stop.plan), "tables": sorted(needed)}
         finally:
             ex.PythonExecutor = real
-    # build-time phase marks: everything compile_only also runs is "compile";
-    # building and running PythonExecutor and pickling the result is "run"
-    real_px = ex.PythonExecutor
+    # build-time phase marks. "compile" is only what runs inside optimize() and Plan(): its
+    # whole output is the plan the digest covers. Everything else in execute() (tables and
+    # schema preparation, logging, PythonExecutor) and the result pickling is "run", since
+    # it can reach the executor outside the plan; a change there needs a full run.
+    real_opt, real_plan = ex.optimize, ex.Plan
     captured = []
 
-    class Marked:
-        def __init__(self, *a, **k):
+    def opt(*a, **k):
+        phase("compile")
+        try:
+            return real_opt(*a, **k)
+        finally:
             phase("run")
-            self._real = real_px(*a, **k)
 
-        def execute(self, plan):
-            captured.append(plan)
-            return self._real.execute(plan)
+    def plan_(*a, **k):
+        phase("compile")
+        try:
+            p = real_plan(*a, **k)
+            captured.append(p)
+            return p
+        finally:
+            phase("run")
 
     if build_marks:
-        ex.PythonExecutor = Marked
+        ex.optimize, ex.Plan = opt, plan_
     try:
-        phase("compile")
-        table = ex.execute(expression, schema=_schema(ds), tables=needed)
         phase("run")
+        table = ex.execute(expression, schema=_schema(ds), tables=needed)
         table = pickle.loads(pickle.dumps(table))  # result comes back to the parent
     finally:
-        ex.PythonExecutor = real_px
+        ex.optimize, ex.Plan = real_opt, real_plan
     phase("front")
-    rec = {"duck": duck, "cols": list(table.columns), "rows": _digest(table.rows)}
+    rec = {"duck": duck, "cols": list(table.columns), "rows": _digest(table.rows), "tables": sorted(needed)}
     if captured:
         phase(None)
         rec["plan"] = plan_digest(captured[-1])
@@ -286,7 +294,7 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
         exp_rec = prof["queries"][i]["out"]
         if i in compile_only and "plan" in (exp_rec or {}):
             rec = run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
-            if rec == {"duck": exp_rec["duck"], "plan": exp_rec["plan"]}:
+            if rec == {"duck": exp_rec["duck"], "plan": exp_rec["plan"], "tables": exp_rec["tables"]}:
                 continue
             if rec.get("duck") != exp_rec["duck"]:
                 return False  # DuckDB would compute a different expected answer

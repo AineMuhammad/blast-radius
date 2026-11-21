@@ -30,7 +30,7 @@ ROOT = ROOT.rstrip("/") + "/"
 def load_traces():
     tests = {}
     imp = defaultdict(set)
-    global import_func_lines, import_types
+    global import_func_lines, import_types, WATCHED
     for f in sorted(glob.glob(os.path.join(TRACE, "trace_*.json"))):
         d = json.load(open(f))
         for k, v in d["tests"].items():
@@ -40,6 +40,7 @@ def load_traces():
         for k, v in d.get("import_func_lines", {}).items():
             import_func_lines[k].update(v)
         import_types.update(d.get("import_types", []))
+        WATCHED.update(d.get("watched", []))
     nchild = 0
     for f in sorted(glob.glob(os.path.join(TRACE, "child_*.jsonl"))):
         for line in open(f):
@@ -61,6 +62,7 @@ def load_traces():
 
 import_func_lines = defaultdict(set)
 import_types = set()  # qualnames (with bases) of sqlglot classes instantiated while importing
+WATCHED = set()  # "@attr:<class>:<name>" keys whose reads were recorded per test
 tests, import_lines = load_traces()
 if len(tests) < 1600:  # real tests only
     sys.exit(f"only {len(tests)} tests traced; refusing to build an incomplete map")
@@ -266,6 +268,20 @@ def _ref(n, f, qual):
     nm = _refname(n)
     if nm:
         BODY_REFS[nm].add((f, qual))
+
+
+def read_only_at_runtime(C, nm):
+    """The attribute's value only matters through reads during tests: it is not read by
+    class-creation code, nor at import time from an object of a related class, nor
+    copied by another class body."""
+    if nm.startswith("__") or nm in IMPNAMES_META:
+        return False
+    related = [C] + list(DIALECT_OF.get(C, []))
+    if nm in IMPNAMES and any(made_at_import(X) for X in related):
+        return False
+    if BODY_REFS.get(nm):
+        return False  # some class or module body copies or derives from it at import
+    return True
 
 
 def can_narrow(C, names):
@@ -554,7 +570,14 @@ def analyse(f):
                 else:
                     bits = bits_lines(f, a, node.end_lineno)  # lambdas etc inside
                     C = resolve(f, qual) if scope == "c" else None
-                    if scope == "c" and is_family(C):
+                    names = assigned_names(node) if scope == "c" else set()
+                    wkey = f"@attr:{qn(C)}:{next(iter(names))}" if (C is not None and len(names) == 1) else None
+                    if (scope == "c" and is_family(C) and wkey in WATCHED
+                            and isinstance(node, (ast.Assign, ast.AnnAssign))
+                            and read_only_at_runtime(C, next(iter(names)))):
+                        # the tests that read this class's definition of the attribute
+                        bits |= cov.get(wkey, {}).get(0, 0)
+                    elif scope == "c" and is_family(C):
                         names = assigned_names(node)
                         ub = users_ext(C, f, qual)
                         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and can_narrow(C, names):
