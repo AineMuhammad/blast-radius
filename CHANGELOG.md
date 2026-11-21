@@ -63,3 +63,13 @@ Runtime CPU measured in-container on the samples.
 - Gates: 20 edge-case patches OK; 0 misses on samples (4 identical runs), 80 + 48 + 60
   labeled mutants; 60 commits in 31 s wall; clean build 4.4 min on 4 cores.
 - Samples: **121.130 s** + 24.5 s CPU = 145.6 s. Fresh 48: 264.5 s + 11.0 s.
+
+## v6 — first-line coverage, lambda-body edits
+- The tracer also listens to PY_START and records each code object's first line. LINE
+  events alone never fire for code on a function's first line, so one-line lambdas and
+  one-line functions were invisible to coverage (earlier versions were saved by broad
+  fallbacks).
+- An edit confined to the body of a lambda in a module/class-level table selects the
+  tests that call that lambda (lambdas that run during import are excluded).
+- Gates: edge cases OK; 0 misses on samples, 80 + 48 + 60 labeled mutants.
+- Samples: 121.130 s + 23.0 s CPU (unchanged selection, safer coverage).

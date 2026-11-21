@@ -651,6 +651,23 @@ def analyse(f):
                 best[l] = (best[l][0], lb, (node.lineno, node.end_lineno))
 
     SPAN = [None] * (n + 2)
+    # column ranges of lambda bodies inside import-time statements: an edit confined to a
+    # body only matters to the tests that call that lambda
+    LAMCOLS = defaultdict(list)
+    ran_at_import = import_func_lines.get(f, set())
+    for node in lam:
+        if any(l in ran_at_import for l in range(node.lineno, node.end_lineno + 1)):
+            continue  # called while importing: its effect is not in test coverage
+        b = node.body
+        lb = bits_lines(f, node.lineno, node.end_lineno)
+        for l in range(b.lineno, b.end_lineno + 1):
+            text = src_lines[l - 1] if l - 1 < len(src_lines) else ""
+            if not text.isascii():
+                continue  # ast columns are byte offsets
+            c0 = b.col_offset if l == b.lineno else 0
+            c1 = b.end_col_offset if l == b.end_lineno else len(text)
+            LAMCOLS[l].append((c1 - c0, c0, c1, lb))
+
     for l in range(1, n + 1):
         if best[l] is not None:
             M[l] = best[l][1]
@@ -684,7 +701,7 @@ def analyse(f):
                 encl.append((ind, hb))
         encl.sort()
         gaps.append((prev_b or 0, next_b or 0, encl))
-    return M, gaps, sorted(strlines), SPAN
+    return M, gaps, sorted(strlines), SPAN, LAMCOLS
 
 
 def to_hex(b):
@@ -718,7 +735,7 @@ if PROFILE and os.path.exists(PROFILE):
 for i, f in enumerate(FILES):
     if f not in TREES:
         continue
-    M, gaps, strl, SPAN = analyse(f)
+    M, gaps, strl, SPAN, LAMCOLS = analyse(f)
     groups = {}
 
     def gi(b):
@@ -737,7 +754,9 @@ for i, f in enumerate(FILES):
         json.dump(
             {"g": [to_hex(b) for b, _ in sorted(groups.items(), key=lambda kv: kv[1])], "m": m, "i": ii, "s": strl,
              # lines of statements that run at import time (module / class bodies, not lambdas)
-             "t": [l for l in range(1, len(M) - 1) if M[l] is not None and SPAN[l] is None]},
+             "t": [l for l in range(1, len(M) - 1) if M[l] is not None and SPAN[l] is None],
+             # line -> [[col_start, col_end, group], ...] of lambda bodies, innermost first
+             "lam": {str(l): [[c0, c1, gi(lb)] for _, c0, c1, lb in sorted(v)] for l, v in LAMCOLS.items()}},
             fh,
             separators=(",", ":"),
         )

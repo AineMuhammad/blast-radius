@@ -63,6 +63,13 @@ def _line_cb(code, line):
     return M.DISABLE
 
 
+def _start_cb(code, offset):
+    # LINE events fire when execution moves to a new line, so code on a function's first
+    # line (a one-line lambda, `def f(): return x`) would never be seen: record that line
+    # when the code object starts.
+    return _line_cb(code, code.co_firstlineno)
+
+
 def _audit(event, args):
     if _cur_files is None:
         return
@@ -177,7 +184,8 @@ def _install():
     _installed = True
     M.use_tool_id(TOOL, "br_trace")
     M.register_callback(TOOL, M.events.LINE, _line_cb)
-    M.set_events(TOOL, M.events.LINE)
+    M.register_callback(TOOL, M.events.PY_START, _start_cb)
+    M.set_events(TOOL, M.events.LINE | M.events.PY_START)
     sys.addaudithook(_audit)
     import sqlglot  # noqa: F401  core modules, so instances made while importing the rest are seen
 

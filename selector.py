@@ -158,6 +158,31 @@ def _hex(h):
     return int(h, 16) if h else 0
 
 
+def lambda_body_edit(fm, removed, rem_txt, add_txt):
+    """Group of the innermost lambda whose body alone a one-line edit changes, else None."""
+    if len(removed) != 1 or len(add_txt) != 1:
+        return None
+    ranges = fm.get("lam", {}).get(str(removed[0]))
+    if not ranges:
+        return None
+    old, new = rem_txt[0], add_txt[0]
+    if not (old.isascii() and new.isascii()) or old == new:
+        return None
+    p = 0
+    while p < len(old) and p < len(new) and old[p] == new[p]:
+        p += 1
+    q = 0
+    while q < len(old) - p and q < len(new) - p and old[-1 - q] == new[-1 - q]:
+        q += 1
+    end = len(old) - q  # old[p:end] was replaced by new[p:len(new) - q]
+    if end <= p:
+        return None  # pure insertion: not narrowed
+    for c0, c1, grp in ranges:  # innermost first
+        if c0 <= p and end <= c1:
+            return grp
+    return None
+
+
 def select_py(fm, hunks, flags=None):
     """flags (dict) gets 'import_time': True when a change touches code that runs on import,
     and 'blocks': the test bits of each change block."""
@@ -209,9 +234,10 @@ def select_py(fm, hunks, flags=None):
                 flags["import_time"] = True
             rem_code = [l for l in removed if 1 <= l <= nlines and M[l] >= 0]
             bbits = 0
+            narrowed = lambda_body_edit(fm, removed, rem_txt, add_txt)
             for l in removed:
                 if 1 <= l <= nlines:
-                    bbits |= g(M[l])
+                    bbits |= g(narrowed) if narrowed is not None else g(M[l])
             bits |= bbits
             if rem_code or not add_txt:
                 # replacement: new lines run where the old ones ran

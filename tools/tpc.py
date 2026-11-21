@@ -393,8 +393,9 @@ def _trace_task(args):
     if M.get_tool(5) is None:
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
+    M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
     t0 = time.process_time()
-    M.set_events(5, M.events.LINE)
+    M.set_events(5, M.events.LINE | M.events.PY_START)
     try:
         rec = run_one(ds, mode, meta, sql, optimized, tables, phase=phase)
         err = None
@@ -460,8 +461,9 @@ def _setup_task(args):
     if M.get_tool(5) is None:
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
+    M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
     _types = set()
-    M.set_events(5, M.events.LINE)
+    M.set_events(5, M.events.LINE | M.events.PY_START)
     if ds == "dialects":
         _queries(ds)  # iterating Dialects
     else:
@@ -529,8 +531,9 @@ def _opt_task(args):
     if M.get_tool(5) is None:
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
+    M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
     phase(opt_model.REST)
-    M.set_events(5, M.events.LINE)
+    M.set_events(5, M.events.LINE | M.events.PY_START)
     try:
         traced = opt_model.Harness(on_phase=phase).run(method)
     finally:
@@ -576,7 +579,8 @@ def _opt_setup_task(root):
     if M.get_tool(5) is None:
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
-    M.set_events(5, M.events.LINE)
+    M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
+    M.set_events(5, M.events.LINE | M.events.PY_START)
     sqlglot.schema = MappingSchema()
     M.set_events(5, 0)
     return {f: sorted(v) for f, v in lines.items()}
