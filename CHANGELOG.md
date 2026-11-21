@@ -128,3 +128,16 @@ Runtime CPU measured in-container on the samples.
   miss is re-labeled on an idle machine before it is trusted.
 - Samples 106.391 s + 2.7 s CPU; fresh 248.461 s; 80 random 280.956 s (v8 299.125 s);
   150-set 666.871 s. 0 misses on all sets; edge cases OK; byte-identical runs.
+
+## v9.1 — precise TPC run phase, capped fallbacks
+- Run phase = ensure_tables (the table mapping handed to the executor), PythonExecutor,
+  result pickling, plus every line of execute()'s own body. The rest of execute() (schema
+  preparation, logging) is compile phase, which a compile-only check really executes.
+  Targeted tests: ensure_tables returning {} and PythonExecutor(tables={}) both schedule
+  test_execute_tpcds.
+- At most 3 plan-changed queries per check fall back to a full run; beyond that the test is
+  scheduled (deterministic count, no timing). Fresh m02044 had spent 26 s CPU for 16 s.
+- Samples 106.391 s + 2.5 s; fresh 264.6 + 10.9 s; 80 random 281.0 + 13.6 s;
+  150-set 682.8 + 39.6 s. 0 misses everywhere; byte-identical runs; edge cases OK.
+- Probes with a 100 s CPU burn (can never become our best score):
+  probe-no-tpcds cf92b43, probe-no-long-tests 7de20ae.

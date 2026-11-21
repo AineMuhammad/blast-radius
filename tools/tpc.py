@@ -196,37 +196,38 @@ def run_one(ds, mode, meta, sql, optimized, tables, compile_only=False, phase=No
             return {"duck": duck, "plan": plan_digest(stop.plan), "tables": sorted(needed)}
         finally:
             ex.PythonExecutor = real
-    # build-time phase marks. "compile" is only what runs inside optimize() and Plan(): its
-    # whole output is the plan the digest covers. Everything else in execute() (tables and
-    # schema preparation, logging, PythonExecutor) and the result pickling is "run", since
-    # it can reach the executor outside the plan; a change there needs a full run.
-    real_opt, real_plan = ex.optimize, ex.Plan
-    captured = []
+    # build-time phase marks. Two things flow from execute() into the executor: the plan
+    # (digested) and the table mapping built by ensure_tables (not digested). So "run" is
+    # ensure_tables, PythonExecutor and the result pickling; everything else execute()
+    # does is "compile", which a compile-only check really executes with patched code.
+    real_et, real_px = ex.ensure_tables, ex.PythonExecutor
 
-    def opt(*a, **k):
-        phase("compile")
-        try:
-            return real_opt(*a, **k)
-        finally:
-            phase("run")
-
-    def plan_(*a, **k):
-        phase("compile")
-        try:
-            p = real_plan(*a, **k)
-            captured.append(p)
-            return p
-        finally:
-            phase("run")
-
-    if build_marks:
-        ex.optimize, ex.Plan = opt, plan_
-    try:
+    def et(*a, **k):
         phase("run")
+        try:
+            return real_et(*a, **k)
+        finally:
+            phase("compile")
+
+    class Marked:
+        def __init__(self, *a, **k):
+            phase("run")
+            self._real = real_px(*a, **k)
+
+        def execute(self, plan):
+            captured.append(plan)
+            return self._real.execute(plan)
+
+    captured = []
+    if build_marks:
+        ex.ensure_tables, ex.PythonExecutor = et, Marked
+    try:
+        phase("compile")
         table = ex.execute(expression, schema=_schema(ds), tables=needed)
+        phase("run")
         table = pickle.loads(pickle.dumps(table))  # result comes back to the parent
     finally:
-        ex.optimize, ex.Plan = real_opt, real_plan
+        ex.ensure_tables, ex.PythonExecutor = real_et, real_px
     phase("front")
     rec = {"duck": duck, "cols": list(table.columns), "rows": _digest(table.rows), "tables": sorted(needed)}
     if captured:
@@ -271,6 +272,9 @@ def load_tables(data_dir, ds, names):
 
 
 # ---------------------------------------------------------------- run time
+MAX_FULL_FALLBACKS = 3  # plan changed -> full run of that query, at most this many per check
+
+
 def check(data_dir, test_id, indices, budget, compile_only=()):
     """True if every listed query reproduces its stored outputs.
 
@@ -289,6 +293,7 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
         names.update(prof["queries"][i].get("tables", []))
     tables = load_tables(data_dir, ds, sorted(names)) if names else {}
     compile_only = set(compile_only)
+    fallbacks = 0
     for i in indices:
         meta, sql, optimized = queries[i]
         exp_rec = prof["queries"][i]["out"]
@@ -298,7 +303,11 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
                 continue
             if rec.get("duck") != exp_rec["duck"]:
                 return False  # DuckDB would compute a different expected answer
-            # the plan changed but the test only compares results: run this query fully
+            # the plan changed but the test only compares results: run this query fully,
+            # for a few queries only (a change that alters many plans is cheaper to schedule)
+            fallbacks += 1
+            if fallbacks > MAX_FULL_FALLBACKS:
+                return False
             rec = run_one(ds, mode, meta, sql, optimized, tables)
             if {k: v for k, v in rec.items() if k != "plan"} != {k: v for k, v in exp_rec.items() if k != "plan"}:
                 return False
@@ -423,6 +432,17 @@ def _trace_task(args):
             lines.setdefault(f, set()).update(v)
         types |= ts
     run_lines, run_types = buckets["run"]
+    if mode == "execute" and meta.get("execute"):
+        # execute()'s own body decides what reaches the executor (e.g. its arguments), and
+        # a compile-only check replaces the executor: any edit there needs a full run
+        import ast as _ast
+
+        rel = "sqlglot/executor/__init__.py"
+        tree = _ast.parse(open(os.path.join(root, rel)).read())
+        for node in tree.body:
+            if isinstance(node, _ast.FunctionDef) and node.name == "execute":
+                run_lines.setdefault(rel, set()).update(range(node.lineno, node.end_lineno + 1))
+                lines.setdefault(rel, set()).update(range(node.lineno, node.end_lineno + 1))
     traced = time.process_time() - t0
     # untraced timing for the cost model
     t0 = time.process_time()
