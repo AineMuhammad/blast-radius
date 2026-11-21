@@ -1013,6 +1013,10 @@ def main():
                             nums = set(ms)
                     except Exception as e:  # noqa: BLE001
                         log(f"{cid}: local run skipped ({e!r})")
+        # PROBE BUILD: tests longer than 5 s (test_max_nodes, test_execute_tpcds,
+        # test_generator_memory) are never scheduled, to measure on the board how often
+        # they are needed and what they cost. Not for the final.
+        nums = {n for n in nums if ms[n] <= 5000}
         workers = pack([(ms[n], n) for n in nums])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
