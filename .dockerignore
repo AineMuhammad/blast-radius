@@ -3,4 +3,5 @@
 !tools/br_trace.py
 !tools/build_map.py
 !tools/tpc.py
+!tools/opt_model.py
 !selector.py

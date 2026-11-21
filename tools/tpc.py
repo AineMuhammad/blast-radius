@@ -37,6 +37,21 @@ FIXTURE = {"tpch": "optimizer/tpc-h/tpc-h.sql", "tpcds": "optimizer/tpc-ds/tpc-d
 DATA_DIR = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 
 
+def calib():
+    """CPU seconds of a fixed pure-Python workload (best of 3).
+
+    Costs are stored relative to this, so estimates follow the speed and load of the
+    machine they run on rather than the build machine's. selector.py has the same loop."""
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.process_time()
+        x = 0
+        for i in range(200000):
+            x += i * i
+        best = min(best, time.process_time() - t0)
+    return best
+
+
 def _digest(obj):
     return hashlib.sha256(pickle.dumps(obj, protocol=4)).hexdigest()
 
@@ -252,9 +267,14 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
     """True if every listed query reproduces its stored outputs.
 
     Queries in compile_only are checked up to the executor's plan."""
-    ds, mode = TESTS[test_id]
     with open(os.path.join(data_dir, "expect.json")) as f:
         prof = json.load(f)[test_id]
+    if prof.get("mode") == "optimizer":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import opt_model
+
+        return opt_model.check(test_id.rsplit("::", 1)[1], prof["items"], indices, prof["expect"])
+    ds, mode = TESTS[test_id]
     queries = _queries(ds)
     names = set()
     for i in indices:
@@ -282,8 +302,15 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
 _types = None
 
 
+_HOOKED = False
+
+
 def _hook_classes():
     """Record sqlglot classes instantiated (same families as tools/br_trace.py)."""
+    global _HOOKED
+    if _HOOKED:
+        return
+    _HOOKED = True
     import sqlglot.expressions as exp
     from sqlglot import generator, parser, tokens
     from sqlglot.dialects.dialect import Dialect, Dialects
@@ -363,7 +390,8 @@ def _trace_task(args):
         M.restart_events()
 
     _hook_classes()
-    M.use_tool_id(5, "tpc")
+    if M.get_tool(5) is None:
+        M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
     t0 = time.process_time()
     M.set_events(5, M.events.LINE)
@@ -391,6 +419,8 @@ def _trace_task(args):
     if rec is not None and "plan" in rec:
         run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
     cpu_compile = time.process_time() - t0 if rec is not None and "plan" in rec else None
+    unit = calib()
+    cpu, cpu_compile = cpu / unit, (cpu_compile / unit if cpu_compile is not None else None)
     used = []
     if mode == "execute" and meta.get("execute"):
         from sqlglot import find_tables, parse_one
@@ -399,7 +429,8 @@ def _trace_task(args):
     return test_id, i, {
         "out": rec,
         "err": err,
-        "cpu": round(cpu, 4),
+        "unit": round(unit, 6),
+        "cpu": round(cpu, 4),  # in calib() units
         "cpu_compile": round(cpu_compile, 4) if cpu_compile is not None else None,
         "run_lines": {f: sorted(v) for f, v in run_lines.items()},
         "run_classes": _classes(run_types),
@@ -426,7 +457,8 @@ def _setup_task(args):
 
     global _types
     _hook_classes()
-    M.use_tool_id(5, "tpc")
+    if M.get_tool(5) is None:
+        M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
     _types = set()
     M.set_events(5, M.events.LINE)
@@ -453,9 +485,135 @@ def _setup_task(args):
     return ds, ({f: sorted(v) for f, v in out.items()}, [] if ds == "dialects" else _classes(types))
 
 
+OPT_PREFIX = "tests/test_optimizer.py::TestOptimizer::"
+
+
+def _opt_task(args):
+    """Profile one TestOptimizer method: warm-up run, then a traced run per entry."""
+    root, method = args
+    from sys import monitoring as M
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import opt_model
+
+    tid = OPT_PREFIX + method
+    try:
+        opt_model.load_module()  # imports are not part of what a check costs
+        t0 = time.process_time()
+        warm = opt_model.Harness().run(method)
+        total = time.process_time() - t0
+    except Exception as e:  # noqa: BLE001
+        return tid, None, f"not modelled: {e!r}"
+    if warm.failures:
+        return tid, None, f"fails under the stand-ins: {sorted(map(str, warm.failures))[:3]}"
+
+    global _types
+    _hook_classes()
+    prefix = os.path.join(root, "sqlglot") + "/"
+    buckets = {}
+    cur = [None]
+
+    def cb(code, line):
+        b = cur[0]
+        if b is not None and code.co_filename.startswith(prefix) and code.co_flags & 1:
+            b[0].setdefault(code.co_filename[len(root) + 1:], set()).add(line)
+        return M.DISABLE
+
+    def phase(key):
+        global _types
+        b = buckets.setdefault(key, ({}, set()))
+        cur[0] = b
+        _types = b[1]
+        M.restart_events()
+
+    if M.get_tool(5) is None:
+        M.use_tool_id(5, "tpc")
+    M.register_callback(5, M.events.LINE, cb)
+    phase(opt_model.REST)
+    M.set_events(5, M.events.LINE)
+    try:
+        traced = opt_model.Harness(on_phase=phase).run(method)
+    finally:
+        M.set_events(5, 0)
+        cur[0] = None
+        _types = None
+    if traced.failures or traced.keys != warm.keys:
+        return tid, None, "traced run differs from warm-up run"
+    unit = calib()
+    items = [list(k) for k in warm.keys] + [opt_model.REST]
+    recs = []
+    for k in warm.keys + [opt_model.REST]:
+        ls, ts = buckets.get(k, ({}, set()))
+        cpu = warm.cpu.get(k, 0) if k != opt_model.REST else max(0.0, total - sum(warm.cpu.values()))
+        cpu /= unit
+        recs.append({
+            "out": {"pairs": warm.pairs.get(k, [])},
+            "cpu": round(cpu, 4),
+            "cpu_compile": None,
+            "tables": [],
+            "classes": _classes(ts),
+            "lines": {f: sorted(v) for f, v in ls.items()},
+        })
+    expect = {repr(k): v for k, v in warm.pairs.items() if k != opt_model.REST}
+    return tid, {"mode": "optimizer", "items": items, "expect": expect, "queries": recs}, None
+
+
+def _opt_setup_task(root):
+    """Coverage of what setUpClass does besides the pool and DuckDB."""
+    from sys import monitoring as M
+
+    prefix = os.path.join(root, "sqlglot") + "/"
+    lines = {}
+
+    def cb(code, line):
+        if code.co_filename.startswith(prefix) and code.co_flags & 1:
+            lines.setdefault(code.co_filename[len(root) + 1:], set()).add(line)
+        return M.DISABLE
+
+    import sqlglot
+    from sqlglot.schema import MappingSchema
+
+    if M.get_tool(5) is None:
+        M.use_tool_id(5, "tpc")
+    M.register_callback(5, M.events.LINE, cb)
+    M.set_events(5, M.events.LINE)
+    sqlglot.schema = MappingSchema()
+    M.set_events(5, 0)
+    return {f: sorted(v) for f, v in lines.items()}
+
+
+def _selfcheck_task(args):
+    """Each model must pass on the unpatched code, all items and every other item."""
+    root, out_dir, tid, n, has_plan = args
+    try:
+        if has_plan:
+            # compile-only on every query, full runs on a spread of them
+            if not check(out_dir, tid, list(range(n)), 900, compile_only=list(range(n))):
+                return tid, False
+            return tid, check(out_dir, tid, list(range(0, n, 4)), 900)
+        if not check(out_dir, tid, list(range(n)), 900):
+            return tid, False
+        return tid, check(out_dir, tid, list(range(1, n, 2)), 900)
+    except Exception:  # noqa: BLE001
+        return tid, False
+
+
 def _init(root):
     os.chdir(root)
     sys.path.insert(0, root)
+
+
+def opt_methods(root):
+    import subprocess
+
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); import opt_model; "
+         "print('\\n'.join(opt_model.methods(sys.argv[1])))",
+         root, os.path.dirname(os.path.abspath(__file__))],
+        capture_output=True, text=True, cwd=root, check=True,
+    )
+    return [m for m in out.stdout.split() if m.startswith("test")]
 
 
 def profile(root, out_dir):
@@ -463,6 +621,8 @@ def profile(root, out_dir):
 
     sys.path.insert(0, root)
     os.chdir(root)
+    # calib() on an otherwise idle machine, one process: the reference for run time
+    idle_unit = min(calib() for _ in range(15))
     for ds in ("tpch", "tpcds"):
         os.makedirs(os.path.join(out_dir, ds), exist_ok=True)
         for table in _schema(ds):
@@ -478,20 +638,64 @@ def profile(root, out_dir):
         for tid, i, rec in pool.imap_unordered(_trace_task, tasks):
             res[tid]["queries"][i] = rec
         setup = dict(pool.map(_setup_task, [(root, out_dir, ds) for ds in ("tpch", "tpcds", "dialects")]))
+        opt_setup = pool.apply(_opt_setup_task, (root,))
+    # optimizer per-entry models: off by default. On fresh out-of-sample commits they
+    # traded simulated seconds for the same CPU and cost two minutes of build time.
+    # Methods share worker processes; code that only runs once per process then shows
+    # up as "unmodelled" for later methods, which keeps them conservative.
+    opt_res = []
+    if os.environ.get("BR_OPT_MODELS") == "1":
+        with ctx.Pool(4, initializer=_init, initargs=(root,), maxtasksperchild=12) as pool:
+            opt_res = list(pool.imap_unordered(_opt_task, [(root, m) for m in opt_methods(root)]))
     for tid, (ds, _) in TESTS.items():
         res[tid]["setup_lines"], res[tid]["setup_classes"] = setup[ds]
-    bad = [(tid, q["err"]) for tid in res for q in res[tid]["queries"] if q["err"]]
+    skipped = []
+    for tid, rec, why in opt_res:
+        if rec is None:
+            skipped.append((tid.rsplit("::", 1)[1], why))
+            continue
+        rec["setup_lines"], rec["setup_classes"] = opt_setup, []
+        res[tid] = rec
+    print(f"optimizer methods modelled: {sum(1 for _, r, _ in opt_res if r)}, skipped: {len(skipped)}",
+          file=sys.stderr)
+    for m, why in skipped[:12]:
+        print(f"  skipped {m}: {why[:100]}", file=sys.stderr)
+    bad = [(tid, q["err"]) for tid in res for q in res[tid]["queries"] if q.get("err")]
     if bad:
         raise SystemExit(f"TPC profile: unpatched queries failed: {bad[:3]}")
+    def write_slim():
+        slim = {}
+        for tid, v in res.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get("mode") == "optimizer":
+                slim[tid] = {"mode": "optimizer", "items": v["items"], "expect": v["expect"]}
+            else:
+                slim[tid] = {"queries": [{"out": q["out"], "tables": q["tables"]} for q in v["queries"]]}
+        with open(os.path.join(out_dir, "expect.json"), "w") as f:
+            json.dump(slim, f, separators=(",", ":"))
+
+    # self-check in fresh processes: a model that does not reproduce the unpatched
+    # outcome is dropped, so the selector never relies on it
+    write_slim()
+    jobs = [(root, out_dir, tid, len(v["queries"]),
+             any(q.get("out") and "plan" in q["out"] for q in v["queries"])) for tid, v in res.items()]
+    with ctx.Pool(4, initializer=_init, initargs=(root,), maxtasksperchild=1) as pool:
+        verdicts = dict(pool.imap_unordered(_selfcheck_task, jobs))
+    dropped = sorted(t for t, ok in verdicts.items() if not ok)
+    for t in dropped:
+        del res[t]
+    print(f"self-check: {len(verdicts) - len(dropped)} models kept, dropped {[t.rsplit('::', 1)[1] for t in dropped]}",
+          file=sys.stderr)
+    res["@idle_unit"] = idle_unit
     with open(os.path.join(out_dir, "profile.json"), "w") as f:
         json.dump(res, f, separators=(",", ":"))
-    # slim copy for run time: expected outputs and tables per query
-    slim = {tid: {"queries": [{"out": q["out"], "tables": q["tables"]} for q in v["queries"]]} for tid, v in res.items()}
-    with open(os.path.join(out_dir, "expect.json"), "w") as f:
-        json.dump(slim, f, separators=(",", ":"))
-    for tid in res:
+    print(f"calibration unit (idle, one process): {idle_unit * 1000:.2f} ms", file=sys.stderr)
+    write_slim()
+    unit = calib()
+    for tid in [t for t in TESTS if t in res]:
         print(tid, "queries", len(res[tid]["queries"]),
-              "cpu %.2f s" % sum(q["cpu"] for q in res[tid]["queries"]), file=sys.stderr)
+              "cpu %.2f s (here)" % (unit * sum(q["cpu"] for q in res[tid]["queries"])), file=sys.stderr)
 
 
 if __name__ == "__main__":

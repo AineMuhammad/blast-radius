@@ -73,7 +73,7 @@ pseudo = {}
 if PROFILE and os.path.exists(PROFILE):
     _prof = json.load(open(PROFILE))
     for tid, v in _prof.items():
-        if tid not in tests:
+        if tid not in tests or not isinstance(v, dict):
             continue
         for qi, q in enumerate(v["queries"]):
             pseudo[f"@tpc:{tid}#{qi}"] = {"lines": q["lines"], "classes": q.get("classes", [])}
@@ -149,12 +149,13 @@ for tid in {p.split("#")[0][5:] for p in pseudo}:
 
 # --- static analysis --------------------------------------------------------
 def py_files():
+    """Every Python file in the checkout (tests also run e.g. sqlglotc/setup.py)."""
     out = []
-    for base in ("sqlglot", "tests"):
-        for dp, dn, fn in os.walk(ROOT + base):
-            for f in fn:
-                if f.endswith(".py"):
-                    out.append(os.path.relpath(os.path.join(dp, f), ROOT))
+    for dp, dn, fn in os.walk(ROOT):
+        dn[:] = [d for d in dn if d not in (".git", "__pycache__")]
+        for f in fn:
+            if f.endswith(".py"):
+                out.append(os.path.relpath(os.path.join(dp, f), ROOT))
     return sorted(out)
 
 
@@ -446,6 +447,8 @@ except Exception as e:  # pragma: no cover
 
 
 def resolve(f, qual):
+    if not f.startswith(("sqlglot/", "tests/")):
+        return None  # never import scripts such as setup.py
     try:
         o = importlib.import_module(modname(f))
         for part in qual.split("."):
@@ -693,12 +696,18 @@ index = {"tests": ids, "files": {}, "data": {}, "dirs": {}, "testfile": {}, "hea
 if PROFILE and os.path.exists(PROFILE):
     pdir = os.path.dirname(PROFILE)
     for tid, v in json.load(open(PROFILE)).items():
-        if tid in IDX:
+        if tid in IDX and isinstance(v, dict):
             index["heavy"][tid] = {
                 "cpu": [q["cpu"] for q in v["queries"]],
                 "cpu_compile": [q.get("cpu_compile") for q in v["queries"]],
+                # items that always run when the test is checked (optimizer "rest")
+                "always": [i for i, it in enumerate(v.get("items", [])) if it == "rest"],
                 "tables": [q["tables"] for q in v["queries"]],
             }
+    # calib() seconds measured before profiling started (idle machine, one process)
+    _p = json.load(open(PROFILE))
+    if _p.get("@idle_unit"):
+        index["cpu_unit"] = _p["@idle_unit"]
     sizes = {}
     for ds in ("tpch", "tpcds"):
         d = os.path.join(pdir, ds)
@@ -726,7 +735,9 @@ for i, f in enumerate(FILES):
     name = f"f{i}.json"
     with open(os.path.join(OUT, name), "w") as fh:
         json.dump(
-            {"g": [to_hex(b) for b, _ in sorted(groups.items(), key=lambda kv: kv[1])], "m": m, "i": ii, "s": strl},
+            {"g": [to_hex(b) for b, _ in sorted(groups.items(), key=lambda kv: kv[1])], "m": m, "i": ii, "s": strl,
+             # lines of statements that run at import time (module / class bodies, not lambdas)
+             "t": [l for l in range(1, len(M) - 1) if M[l] is not None and SPAN[l] is None]},
             fh,
             separators=(",", ":"),
         )

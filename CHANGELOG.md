@@ -47,3 +47,19 @@ Runtime CPU measured in-container on the samples.
 - Samples: **142.584 s** + 8.5 s CPU = 151.1 s, 0 misses (3 identical runs).
 - 80 generated mutants: 330.7 s + 21.3 s CPU, 0 misses (v3: 357.7 s + 16.7 s).
 - Clean build: 4.1 min.
+- Board (791a089): **178.6 s** (176.197 s simulated + 2.36 s CPU), 0 misses.
+
+## v5 — hardening for the final
+- Patched sources are compiled; when import-time code changes, the patched modules are
+  test-imported in a forked child. A syntax error or a failing import selects every test.
+- Deleted or renamed modules, `conftest.py`, and pytest sections of config files select
+  every test. The selector falls back to the whole suite if it ever fails outright.
+- The map covers every Python file the suite runs (e.g. `sqlglotc/setup.py`).
+- Profiled costs are normalized by a calibration workload measured on an idle build
+  machine, so local-check decisions are deterministic across runs.
+- Every item model is self-checked against the unpatched code at build time; failures
+  are dropped. Optimizer per-entry models and the sentinel rule are implemented but off:
+  on fresh out-of-sample commits the first gained nothing, the second missed once.
+- Gates: 20 edge-case patches OK; 0 misses on samples (4 identical runs), 80 + 48 + 60
+  labeled mutants; 60 commits in 31 s wall; clean build 4.4 min on 4 cores.
+- Samples: **121.130 s** + 24.5 s CPU = 145.6 s. Fresh 48: 264.5 s + 11.0 s.

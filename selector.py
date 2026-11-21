@@ -158,8 +158,14 @@ def _hex(h):
     return int(h, 16) if h else 0
 
 
-def select_py(fm, hunks):
+def select_py(fm, hunks, flags=None):
+    """flags (dict) gets 'import_time': True when a change touches code that runs on import,
+    and 'blocks': the test bits of each change block."""
     bits = 0
+    block_bits = flags.setdefault("blocks", []) if flags is not None else []
+    T = fm.get("tset")
+    if T is None:
+        T = fm["tset"] = set(fm.get("t", ()))
     G = fm["gb"]
     M = fm["m"]
     I = fm["i"]
@@ -198,37 +204,43 @@ def select_py(fm, hunks):
                 if None not in rc and None not in ac:
                     if [c for c in rc if c.strip()] == [c for c in ac if c.strip()]:
                         continue  # only comments / blank lines changed
+            if flags is not None and (any(l in T for l in removed) or (not removed and (
+                    a == 0 or a in T or (a + 1) in T))):
+                flags["import_time"] = True
             rem_code = [l for l in removed if 1 <= l <= nlines and M[l] >= 0]
+            bbits = 0
             for l in removed:
                 if 1 <= l <= nlines:
-                    bits |= g(M[l])
+                    bbits |= g(M[l])
+            bits |= bbits
             if rem_code or not add_txt:
                 # replacement: new lines run where the old ones ran
+                block_bits.append(bbits)
                 continue
             # pure insertion (or replacing blank/comment lines) after old line a
             a = max(0, min(a, nlines))
             prev_i, next_i, encl = I[a]
-            bits |= g(prev_i) | g(next_i)
+            ib = bbits | g(prev_i) | g(next_i)
             ind = None
             for t in add_txt:
                 st = t.strip()
                 if st and not st.startswith("#"):
                     ind = len(t) - len(t.lstrip())
                     break
-            if ind is None:
-                continue
-            if prev_i >= 0 and prev_i == next_i and a >= 1 and M[a] == prev_i and a + 1 <= nlines and M[a + 1] == next_i:
-                # inside one statement (e.g. a new dict entry): that statement's set
-                continue
-            chosen = None
-            for e_ind, e_gi in encl:
-                if e_ind <= ind:
-                    chosen = e_gi
-            if chosen is not None:
-                bits |= g(chosen)
-            else:
-                for _, e_gi in encl:
-                    bits |= g(e_gi)
+            inside_one = (prev_i >= 0 and prev_i == next_i and a >= 1 and M[a] == prev_i
+                          and a + 1 <= nlines and M[a + 1] == next_i)
+            if ind is not None and not inside_one:
+                chosen = None
+                for e_ind, e_gi in encl:
+                    if e_ind <= ind:
+                        chosen = e_gi
+                if chosen is not None:
+                    ib |= g(chosen)
+                else:
+                    for _, e_gi in encl:
+                        ib |= g(e_gi)
+            bits |= ib
+            block_bits.append(ib)
     return bits
 
 
@@ -239,7 +251,13 @@ def select(mp, patch_text, info=None):
     if info is not None:
         info["files"] = {}
         info["local_ok"] = True
+        info["import_check"] = []  # patched modules whose import-time code changed
+        info["force_all"] = False
+        info["blocks"] = []  # test bits per change block of .py files
+        info["data_bits"] = 0  # tests reached through non-Python files
     for f in parse_patch(patch_text):
+        if info is not None and _affects_test_config(f):
+            info["force_all"] = True
         if info is not None:
             o, nw = f["old"], f["new"]
             if (o != nw or o in (None, "/dev/null") or f["binary"] or not o.endswith(".py")
@@ -255,13 +273,22 @@ def select(mp, patch_text, info=None):
         is_del = new == "/dev/null"
         if path.endswith(".py"):
             fm = mp.fmap(path)
+            if (fm is not None and (is_del or old != new) and info is not None
+                    and path.startswith(("sqlglot/", "tests/"))):
+                # a module that disappears can break importing sqlglot or the test files
+                info["force_all"] = True
             if fm is not None and not is_new:
                 if is_del:
                     for gb in fm["gb"]:
                         bits |= gb
                     bits |= _hex(idx["testfile"].get(path))
                 else:
-                    bits |= select_py(fm, f["hunks"])
+                    flags = {}
+                    bits |= select_py(fm, f["hunks"], flags)
+                    if info is not None:
+                        info["blocks"].extend(flags.get("blocks", []))
+                        if flags.get("import_time"):
+                            info["import_check"].append(path)
                 if old != new and new != "/dev/null" and not is_del:
                     # rename: like deleting old
                     for gb in fm["gb"]:
@@ -272,17 +299,47 @@ def select(mp, patch_text, info=None):
                 bits |= _hex(idx["dirs"].get(d))
         else:
             for p in {old, new} - {"/dev/null", None}:
-                bits |= _hex(idx["data"].get(p))
+                db = _hex(idx["data"].get(p))
                 if is_new or is_del or old != new:
-                    bits |= _hex(idx["dirs"].get(os.path.dirname(p)))
+                    db |= _hex(idx["dirs"].get(os.path.dirname(p)))
+                bits |= db
+                if info is not None:
+                    info["data_bits"] |= db
     return bits
+
+
+CONFIG_FILES = ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")
+
+
+def _affects_test_config(f):
+    """conftest.py anywhere, pytest.ini, or a pytest section of tox.ini/setup.cfg/pyproject.toml.
+
+    These change how every test is collected or run, so the whole suite is selected."""
+    for p in (f["old"], f["new"]):
+        if not p or p == "/dev/null":
+            continue
+        base = os.path.basename(p)
+        if base == "conftest.py" or base == "pytest.ini":
+            return True
+        if base in CONFIG_FILES and os.path.dirname(p) in ("", "tests"):
+            touched = [t for h in f["hunks"] for tag, t in h[2] if tag in "+-"]
+            if any("pytest" in t for t in touched):
+                return True
+            try:
+                with open(os.path.join(SQLGLOT, p), encoding="utf-8") as fh:
+                    old = fh.read()
+            except OSError:
+                old = ""
+            if "pytest" in old:
+                return True  # file already configures pytest: any edit may matter
+    return False
 
 
 # ------------------------------------------------------------ local runs
 SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 TPC_DIR = os.environ.get("BR_TPC", "/app/tpcdata")
 HERE = os.path.dirname(os.path.abspath(__file__))  # tpc.py lives next to this file
-TPC_FACTOR = 1.2  # run-time CPU per profiled query second
+TPC_FACTOR = 1.0  # profiled costs are calibrated to this machine (cpu_unit)
 TPC_LOAD_MS_PER_MB = 25  # loading pre-parsed TPC tables
 TPC_FAIL_FRACTION = 0.25  # a broken query model stops at the first mismatch
 # wall-clock budget for all local runs (the batch has 180 s, the final 270 s for ~1.5x commits)
@@ -344,7 +401,8 @@ def _modname(path):
     return m[: -len(".__init__")] if m.endswith(".__init__") else m
 
 
-def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=()):
+def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=(), import_mods=()):
+    import importlib
     import importlib.abc
     import importlib.util
     import signal
@@ -384,6 +442,17 @@ def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=()):
             return None
 
     sys.meta_path.insert(0, Finder())
+
+    # import-time code changed: a module that no longer imports fails every test using it
+    for m in import_mods:
+        try:
+            importlib.import_module(m)
+        except BaseException as e:  # noqa: BLE001
+            os.write(wfd, json.dumps({"import_error": f"{m}: {e!r}"[:300]}).encode())
+            return
+    if not test_ids and not tpc_tasks:
+        os.write(wfd, json.dumps({"failed": []}).encode())
+        return
 
     failed = set()
     dotted = {}
@@ -472,11 +541,13 @@ def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=()):
         suite.run(res)
     except BaseException:
         failed.update(dotted.values())
-    os.write(wfd, json.dumps(sorted(failed)).encode())
+    os.write(wfd, json.dumps({"failed": sorted(failed)}).encode())
 
 
-def run_local(patched, test_ids, budgets, wall_limit, tpc_tasks=()):
-    """Run tests on the patched tree in a forked child. -> set of failing ids, or None."""
+def run_local(patched, test_ids, budgets, wall_limit, tpc_tasks=(), import_mods=()):
+    """Run tests on the patched tree in a forked child.
+
+    -> {"failed": set of failing ids} | {"import_error": str} | None (the child failed)."""
     import select as _select
     import signal
     import time
@@ -487,7 +558,7 @@ def run_local(patched, test_ids, budgets, wall_limit, tpc_tasks=()):
         code = 0
         try:
             os.close(r)
-            _child_run(patched, test_ids, budgets, w, tpc_tasks)
+            _child_run(patched, test_ids, budgets, w, tpc_tasks, import_mods)
         except BaseException:
             code = 1
         finally:
@@ -519,9 +590,12 @@ def run_local(patched, test_ids, budgets, wall_limit, tpc_tasks=()):
     if not ok or status != 0:
         return None
     try:
-        return set(json.loads(b"".join(chunks).decode()))
+        res = json.loads(b"".join(chunks).decode())
     except Exception:
         return None
+    if "import_error" in res:
+        return res
+    return {"failed": set(res["failed"])}
 
 
 def pack_cost(ms_list):
@@ -602,6 +676,31 @@ def pack(items):
     return [w for w in best[1] if w]
 
 
+_UNIT = None
+
+
+def cpu_unit(index=None):
+    """Seconds for tpc.calib()'s workload: the build-time reading when the map has one, so
+    the same commit always gets the same decision; otherwise measured here once."""
+    global _UNIT
+    # build-time reading, taken on an idle machine before profiling: deterministic, so
+    # every run of the same batch makes the same choices
+    if _UNIT is None and index and index.get("cpu_unit"):
+        _UNIT = index["cpu_unit"]
+    if _UNIT is None:
+        import time
+
+        samples = []
+        for _ in range(9):
+            t0 = time.process_time()
+            x = 0
+            for i in range(200000):
+                x += i * i
+            samples.append(time.process_time() - t0)
+        _UNIT = min(samples)
+    return _UNIT
+
+
 def tpc_plans(mp, qbits, nums, by_id):
     """{test number: (test id, query indices, est ms)} for heavy tests checkable by queries."""
     out = {}
@@ -615,7 +714,7 @@ def tpc_plans(mp, qbits, nums, by_id):
         sel = qbits.get(tid)
         if not sel or sel.get("bad") or not sel.get("q"):
             continue
-        q = sorted(sel["q"] | sel["run"])
+        q = sorted(sel["q"] | sel["run"] | set(h.get("always", [])))
         cc = h.get("cpu_compile") or [None] * len(h["cpu"])
         compile_only = [i for i in q if i not in sel["run"] and cc[i] is not None]
         full = [i for i in q if i not in compile_only]
@@ -626,25 +725,94 @@ def tpc_plans(mp, qbits, nums, by_id):
             names.update(h["tables"][i])  # find_tables / ensure_tables still see them
         ds = "tpch" if "tpch" in tid else "tpcds"
         mb = sum(mp.index.get("table_bytes", {}).get(f"{ds}/{t}", 0) for t in names) / 1e6
-        cpu = sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)
+        cpu = (sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)) * cpu_unit(mp.index)
         est = TPC_FACTOR * 1000 * cpu + TPC_LOAD_MS_PER_MB * mb + 50
         out[n] = (tid, q, est, compile_only)
     return out
 
 
-def refine_local(info, nums, ms, idof, tpc=None):
-    tpc = tpc or {}
-    L = plan_local(nums, ms, idof, {n: v[2] for n, v in tpc.items()},
-                   {n: TPC_FAIL_FRACTION * v[2] for n, v in tpc.items()})
-    if not L:
-        return nums
+def patched_sources(info):
+    """New full text of every patched .py file. -> (dict, problem or None)."""
     patched = {}
     for path, hunks in info["files"].items():
-        with open(os.path.join(SQLGLOT, path), encoding="utf-8") as f:
-            new = apply_hunks(f.read(), hunks)
+        try:
+            with open(os.path.join(SQLGLOT, path), encoding="utf-8") as f:
+                new = apply_hunks(f.read(), hunks)
+        except OSError:
+            return None, None
         if new is None:
-            return nums
+            return None, None  # does not apply to the pinned tree: no local work
+        try:
+            compile(new, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as e:
+            return patched, f"{path} does not compile: {e!r}"[:200]
         patched[path] = new
+    return patched, None
+
+
+# Off: in a fresh out-of-sample check, sentinels that only reach a change statically
+# (they import the module) passed while the heavy test failed. Kept for experiments.
+SENTINEL = os.environ.get("BR_SENTINEL", "0") == "1"
+SENTINEL_HEAVY_MS = 2000  # tests at least this long may be dropped on passing sentinels
+SENTINEL_MIN = 3  # cheap tests that must cover each change block reaching the heavy test
+
+
+def sentinel_plan(info, nums, ms, idof, num_bit, L, tpc, total_bits):
+    """Heavy tests that can be dropped if cheaper tests covering the same changes all pass.
+
+    -> {heavy test: set of sentinel tests}. Every change block that reaches the heavy test
+    needs SENTINEL_MIN cheap, locally runnable tests reaching the same block."""
+    if not SENTINEL or not info.get("local_ok") or any(p.startswith("tests/") for p in info["files"]):
+        return {}
+    blocks = info.get("blocks", [])
+    union = 0
+    for b in blocks:
+        union |= b
+    if (union | info.get("data_bits", 0)) != total_bits:
+        return {}  # some selected tests are not explained by a recorded block
+    runnable = {n for n in nums if n in tpc or not idof[n].startswith(HEAVY_CLASSES)}
+    out = {}
+    for h in nums:
+        if ms[h] < SENTINEL_HEAVY_MS or h in L:
+            continue
+        hb = num_bit.get(h)
+        if hb is None or (info.get("data_bits", 0) >> hb) & 1:
+            continue
+        reach = [b for b in blocks if (b >> hb) & 1]
+        if not reach:
+            continue
+        sent = set()
+        for b in reach:
+            cands = sorted((n for n in runnable if n != h and ms[n] < SENTINEL_HEAVY_MS
+                            and num_bit.get(n) is not None and (b >> num_bit[n]) & 1),
+                           key=lambda n: ms[n])
+            if len(cands) < SENTINEL_MIN:
+                sent = None
+                break
+            sent.update(cands[:max(SENTINEL_MIN, 5)])
+        if sent:
+            cost = sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in sent if n not in L)
+            if cost < ms[h]:
+                out[h] = sent
+    return out
+
+
+def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True, num_bit=None, total_bits=0):
+    """-> (selection, import_error or None)."""
+    tpc = tpc or {}
+    if any(p.startswith("tests/") for p in info["files"]):
+        tpc = {}  # item models mirror the unpatched test code
+    L = plan_local(nums, ms, idof, {n: v[2] for n, v in tpc.items()},
+                   {n: TPC_FAIL_FRACTION * v[2] for n, v in tpc.items()}) if allow_tests else []
+    sentinels = sentinel_plan(info, nums, ms, idof, num_bit or {}, set(L), tpc, total_bits) if allow_tests else {}
+    if sentinels:
+        extra = set().union(*sentinels.values()) - set(L)
+        L = list(L) + sorted(extra)
+    import_mods = [_modname(p) for p in info.get("import_check", []) if p in (patched or {})]
+    if not L and not import_mods:
+        return nums, None
+    if patched is None:
+        return nums, None
     _preload()
     tpc_tasks = [(tpc[n][0], tpc[n][1], 10 + 3 * tpc[n][2] / 1000, tpc[n][3]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
@@ -653,18 +821,29 @@ def refine_local(info, nums, ms, idof, tpc=None):
     import resource
 
     c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    failed = run_local(patched, ids, budgets, wall, tpc_tasks)
+    res = run_local(patched, ids, budgets, wall, tpc_tasks, import_mods)
     c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
     log(f"local cpu {(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime):.3f}s, "
-        f"recorded {sum(ms[n] for n in L) / 1000:.3f}s")
-    if failed is None:
-        return nums
+        f"recorded {sum(ms[n] for n in L) / 1000:.3f}s, estimated {est / 1000:.3f}s, "
+        f"models {len(tpc_tasks)}, imports {len(import_mods)}")
+    if res is None:
+        return nums, None
+    if "import_error" in res:
+        return nums, res["import_error"]
+    failed = res["failed"]
     keep = set(nums) - set(L)
     num_of = {idof[n]: n for n in L}
     keep.update(num_of[t] for t in failed if t in num_of)
+    failed_nums = {num_of[t] for t in failed if t in num_of}
+    for h, sent in sentinels.items():
+        if sent & failed_nums or not sent <= set(L):
+            continue  # a sentinel failed: the change is live, keep the heavy test
+        keep.discard(h)
+        log(f"sentinel: {len(sent)} covering tests passed, dropping {idof[h]}")
     log(f"local: ran {len(L)} tests ({len(tpc_tasks)} by TPC queries), {len(failed)} failed, "
         f"kept {len(keep)} of {len(nums)}")
-    return keep
+    return keep, None
 
 
 def main():
@@ -693,6 +872,7 @@ def main():
         log(f"{len(always)} tests without trace data, always selected")
 
     idof = {t["number"]: t["id"] for t in tests}
+    num_bit = {n: i for i, n in enumerate(bit2num) if n is not None}
     import time
 
     local_enabled = os.environ.get("BR_LOCAL", "1") == "1" and os.path.isdir(SQLGLOT)
@@ -706,10 +886,12 @@ def main():
             continue
         cid = name[: -len(".patch")]
         info, qbits = {}, {}
+        total_bits = 0
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
             bits = select(mp, text, info)
+            total_bits = bits
             nums = set(always)
             qbits = {}
             i = 0
@@ -732,15 +914,51 @@ def main():
         except Exception as e:  # never fail: run everything
             log(f"{cid}: error {e!r}, selecting all")
             nums = set(ms)
-        if local_enabled and nums and info.get("local_ok") and time.monotonic() - t_start < wall_budget:
+        if info.get("force_all"):
+            log(f"{cid}: test configuration or module set changed, selecting all")
+            nums = set(ms)
+        elif info.get("files"):
             try:
-                nums = refine_local(info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id))
-            except Exception as e:
-                log(f"{cid}: local run skipped ({e!r})")
+                patched, problem = patched_sources(info)
+            except Exception as e:  # noqa: BLE001
+                patched, problem = None, None
+                log(f"{cid}: could not rebuild patched sources ({e!r})")
+            if problem:
+                log(f"{cid}: {problem}; selecting all")
+                nums = set(ms)
+            elif local_enabled and patched is not None:
+                in_budget = time.monotonic() - t_start < wall_budget
+                if in_budget or info.get("import_check"):
+                    try:
+                        nums, import_error = refine_local(
+                            info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id), patched,
+                            allow_tests=bool(nums) and info.get("local_ok") and in_budget,
+                            num_bit=num_bit, total_bits=total_bits)
+                        if import_error:
+                            log(f"{cid}: {import_error}; selecting all")
+                            nums = set(ms)
+                    except Exception as e:  # noqa: BLE001
+                        log(f"{cid}: local run skipped ({e!r})")
         workers = pack([(ms[n], n) for n in nums])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
+def fallback():
+    """Last resort if main() fails: every commit runs the whole suite (valid output)."""
+    with open(os.path.join(DATA, "tests.json")) as f:
+        tests = json.load(f)["tests"]
+    workers = pack([(round(t["seconds"] * 1000), t["number"]) for t in tests])
+    lines = []
+    for name in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if name.endswith(".patch"):
+            lines.append(json.dumps({"commit": name[: -len(".patch")], "workers": workers}, separators=(",", ":")))
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001  (nothing has been written to stdout yet)
+        log(f"selector failed ({e!r}); falling back to the whole suite")
+        fallback()

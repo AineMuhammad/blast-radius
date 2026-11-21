@@ -18,14 +18,14 @@ print(len(a), "labeled commits", file=sys.stderr)
 EOF
 chmod -R a+rX "$WORK"
 docker run --rm --read-only --tmpfs /tmp --user 65534:65534 -e HOME=/tmp \
-  -e BR_PFAIL=${BR_PFAIL:-0.5} -v "$REPO/selector.py:/app/selector.py:ro" -v "$MAP:/app/map:ro" \
-  -v "$REPO/tools/tpc.py:/app/tpc.py:ro" ${TPCDATA:+-v "$TPCDATA:/app/tpcdata:ro"} \
+  -e BR_PFAIL=${BR_PFAIL:-0.5} -e BR_SENTINEL=${BR_SENTINEL:-0} -v "$REPO/selector.py:/app/selector.py:ro" -v "$MAP:/app/map:ro" \
+  -v "$REPO/tools/tpc.py:/app/tpc.py:ro" -v "$REPO/tools/opt_model.py:/app/opt_model.py:ro" ${TPCDATA:+-v "$TPCDATA:/app/tpcdata:ro"} \
   -v "$WORK/commits:/data/commits:ro" -v "$WORK/tests.json:/data/tests.json:ro" \
   "$IMAGE" python -S -c "
 import resource, subprocess, sys
 r = subprocess.run(['python', '-S', '/app/selector.py'], stdout=open('/tmp/o', 'w'), stderr=open('/tmp/e', 'w'))
 u = resource.getrusage(resource.RUSAGE_CHILDREN)
 print('selector cpu %.3f s, exit %d' % (u.ru_utime + u.ru_stime, r.returncode), file=sys.stderr)
-sys.stderr.write(''.join(l for l in open('/tmp/e') if l.startswith('local:') or 'error' in l)); sys.stdout.write(open('/tmp/o').read())" > "$WORK/out.jsonl"
+sys.stderr.write(''.join(l for l in open('/tmp/e') if l.startswith(('local:', 'sentinel:')) or 'error' in l)); sys.stdout.write(open('/tmp/o').read())" > "$WORK/out.jsonl"
 python3 "$REPO/tools/evaluate.py" "$WORK" "$WORK/answers.json" "$WORK/out.jsonl" "$@"
 rm -rf "$WORK"

@@ -47,6 +47,9 @@ can fail and spread them across up to eight workers.
 - Pack with longest-processing-time first for every worker count from 1 to 8
   and keep the cheapest.
 
+- Safety nets: patched files are compiled, import-time changes are test-imported, and
+  deleted modules or pytest configuration changes select the whole suite.
+
 Without local runs the selector uses under 0.1 s of CPU for 30 commits.
 
 ## Layout
@@ -60,6 +63,8 @@ Without local runs the selector uses under 0.1 s of CPU for 30 commits.
 | `tools/tpc.py` | Per-item models of the heavy loop tests (build-time profile, run-time check) |
 | `tools/evaluate.py` | Local scorer with per-kind breakdown against the oracle |
 | `tools/run_image.sh`, `tools/eval_set.sh` | Score the image or the selector on a labeled set |
+| `tools/edge_cases.py`, `tools/check_edges.py` | Robustness patches and their checker |
+| `tools/opt_model.py` | Per-entry model of the optimizer tests (off by default) |
 | `tools/mutate.py`, `tools/label.py` | Generate and label extra validation patches |
 | `score.py`, `SCORING.md`, `Makefile` | Official scoring kit |
 

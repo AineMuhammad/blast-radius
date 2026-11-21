@@ -25,7 +25,7 @@ RUN cd /opt/sqlglot \
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
 # per-query model of the TPC executor tests: coverage, cost and unpatched outputs
-COPY tools/tpc.py /app/tpc.py
+COPY tools/tpc.py tools/opt_model.py /app/
 RUN cd /opt/sqlglot && SKIP_INTEGRATION=0 python /app/tpc.py profile /opt/sqlglot /app/tpcdata
 
 COPY tools/build_map.py /build/build_map.py
