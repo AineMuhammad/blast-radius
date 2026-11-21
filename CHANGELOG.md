@@ -86,3 +86,16 @@ Runtime CPU measured in-container on the samples.
   selects nothing.
 - Samples: **106.587 s** + 8.4 s CPU = 115.0 s (v6: 144.1 s), 0 misses.
   Fresh 48: 264.5 s simulated, 0 misses.
+
+## v7.1 — decisions independent of timing and load
+- Local-check costs come only from tests.json seconds and the share of a test's work the
+  selected items represent (a CPU ratio from one profiling process, so speed and load
+  cancel out). No calibration, wall-clock budget or measured CPU enters a decision.
+- The local-work budget is a sum of these estimates. Safety timeouts remain; each one
+  resolves to keeping the tests (a timed-out test counts as failing, a killed child keeps
+  the selection, a slow model check counts as a mismatch).
+- 80-random set: two runs byte-identical (sha256 7b9d6fb24d2f15bb...). Versus v6: -19.5 s
+  from three proven-equivalent `is None` swaps, +21.5 s on m01037, where v6 had timed this
+  machine to justify a run-phase TPC-DS check.
+- Samples: **106.587 s** + 4.1 s CPU = 110.6 s, byte-identical runs, 0 misses.
+  Fresh 48, 80 random, 39 of the 150-set: 0 misses. Edge cases OK.

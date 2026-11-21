@@ -422,7 +422,7 @@ def _affects_test_config(f):
 SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 TPC_DIR = os.environ.get("BR_TPC", "/app/tpcdata")
 HERE = os.path.dirname(os.path.abspath(__file__))  # tpc.py lives next to this file
-TPC_FACTOR = 1.0  # profiled costs are calibrated to this machine (cpu_unit)
+TPC_FACTOR = 1.0  # cost of a full model check, in units of the test's tests.json seconds
 TPC_LOAD_MS_PER_MB = 25  # loading pre-parsed TPC tables
 TPC_FAIL_FRACTION = 0.25  # a broken query model stops at the first mismatch
 # wall-clock budget for all local runs (the batch has 180 s, the final 270 s for ~1.5x commits)
@@ -767,33 +767,12 @@ def pack(items):
     return [w for w in best[1] if w]
 
 
-_UNIT = None
+def tpc_plans(mp, qbits, nums, by_id, ms):
+    """{test number: (test id, query indices, est ms, compile-only indices)}.
 
-
-def cpu_unit(index=None):
-    """Seconds for tpc.calib()'s workload: the build-time reading when the map has one, so
-    the same commit always gets the same decision; otherwise measured here once."""
-    global _UNIT
-    # build-time reading, taken on an idle machine before profiling: deterministic, so
-    # every run of the same batch makes the same choices
-    if _UNIT is None and index and index.get("cpu_unit"):
-        _UNIT = index["cpu_unit"]
-    if _UNIT is None:
-        import time
-
-        samples = []
-        for _ in range(9):
-            t0 = time.process_time()
-            x = 0
-            for i in range(200000):
-                x += i * i
-            samples.append(time.process_time() - t0)
-        _UNIT = min(samples)
-    return _UNIT
-
-
-def tpc_plans(mp, qbits, nums, by_id):
-    """{test number: (test id, query indices, est ms)} for heavy tests checkable by queries."""
+    The estimate is the share of the test's work the selected items represent (a ratio of
+    CPU measured in one profiling process, so machine speed and load cancel out) times the
+    test's tests.json duration. No timing of this machine enters a decision."""
     out = {}
     heavy = mp.index.get("heavy", {})
     if not heavy or not os.path.isdir(TPC_DIR):
@@ -816,8 +795,9 @@ def tpc_plans(mp, qbits, nums, by_id):
             names.update(h["tables"][i])  # find_tables / ensure_tables still see them
         ds = "tpch" if "tpch" in tid else "tpcds"
         mb = sum(mp.index.get("table_bytes", {}).get(f"{ds}/{t}", 0) for t in names) / 1e6
-        cpu = (sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)) * cpu_unit(mp.index)
-        est = TPC_FACTOR * 1000 * cpu + TPC_LOAD_MS_PER_MB * mb + 50
+        whole = sum(c for c in h["cpu"] if c) or 1.0
+        share = (sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)) / whole
+        est = TPC_FACTOR * ms[n] * share + TPC_LOAD_MS_PER_MB * mb + 50
         out[n] = (tid, q, est, compile_only)
     return out
 
@@ -889,7 +869,7 @@ def sentinel_plan(info, nums, ms, idof, num_bit, L, tpc, total_bits):
 
 
 def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True, num_bit=None, total_bits=0):
-    """-> (selection, import_error or None)."""
+    """-> (selection, import_error or None, estimated ms of local work planned)."""
     tpc = tpc or {}
     if any(p.startswith("tests/") for p in info["files"]):
         tpc = {}  # item models mirror the unpatched test code
@@ -901,10 +881,11 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
         L = list(L) + sorted(extra)
     import_mods = [_modname(p) for p in info.get("import_check", []) if p in (patched or {})]
     if not L and not import_mods:
-        return nums, None
+        return nums, None, 0
     if patched is None:
-        return nums, None
+        return nums, None, 0
     _preload()
+    est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
     tpc_tasks = [(tpc[n][0], tpc[n][1], 10 + 3 * tpc[n][2] / 1000, tpc[n][3]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
     budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L if n not in tpc}
@@ -914,14 +895,13 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
     c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     res = run_local(patched, ids, budgets, wall, tpc_tasks, import_mods)
     c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
     log(f"local cpu {(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime):.3f}s, "
         f"recorded {sum(ms[n] for n in L) / 1000:.3f}s, estimated {est / 1000:.3f}s, "
         f"models {len(tpc_tasks)}, imports {len(import_mods)}")
     if res is None:
-        return nums, None
+        return nums, None, est  # the child failed or was too slow: keep every test
     if "import_error" in res:
-        return nums, res["import_error"]
+        return nums, res["import_error"], est
     failed = res["failed"]
     keep = set(nums) - set(L)
     num_of = {idof[n]: n for n in L}
@@ -934,7 +914,7 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
         log(f"sentinel: {len(sent)} covering tests passed, dropping {idof[h]}")
     log(f"local: ran {len(L)} tests ({len(tpc_tasks)} by TPC queries), {len(failed)} failed, "
         f"kept {len(keep)} of {len(nums)}")
-    return keep, None
+    return keep, None, est
 
 
 def main():
@@ -970,8 +950,10 @@ def main():
     cdir = os.path.join(DATA, "commits")
     out = []
     n_commits = sum(1 for x in os.listdir(cdir) if x.endswith(".patch"))
-    wall_budget = min(LOCAL_WALL_MAX, LOCAL_WALL_PER_COMMIT * n_commits)
-    t_start = time.monotonic()
+    # budget for local work in *estimated* CPU (tests.json seconds, recorded check costs):
+    # the same batch always gets the same checks, whatever the machine's speed or load
+    est_budget = 1000 * min(LOCAL_WALL_MAX, LOCAL_WALL_PER_COMMIT * n_commits)
+    est_used = 0
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
@@ -1018,13 +1000,14 @@ def main():
                 log(f"{cid}: {problem}; selecting all")
                 nums = set(ms)
             elif local_enabled and patched is not None:
-                in_budget = time.monotonic() - t_start < wall_budget
+                in_budget = est_used < est_budget
                 if in_budget or info.get("import_check"):
                     try:
-                        nums, import_error = refine_local(
-                            info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id), patched,
+                        nums, import_error, spent = refine_local(
+                            info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id, ms), patched,
                             allow_tests=bool(nums) and info.get("local_ok") and in_budget,
                             num_bit=num_bit, total_bits=total_bits)
+                        est_used += spent
                         if import_error:
                             log(f"{cid}: {import_error}; selecting all")
                             nums = set(ms)
