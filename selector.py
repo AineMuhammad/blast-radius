@@ -798,7 +798,9 @@ def tpc_plans(mp, qbits, nums, by_id, ms):
         whole = sum(c for c in h["cpu"] if c) or 1.0
         share = (sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)) / whole
         est = TPC_FACTOR * ms[n] * share + TPC_LOAD_MS_PER_MB * mb + 50
-        out[n] = (tid, q, est, compile_only)
+        # worst case: every compile-only query also runs fully (its plan changed)
+        worst = TPC_FACTOR * ms[n] * sum(h["cpu"][i] for i in q) / whole + TPC_LOAD_MS_PER_MB * mb + 50
+        out[n] = (tid, q, est, compile_only, worst)
     return out
 
 
@@ -886,9 +888,11 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
         return nums, None, 0
     _preload()
     est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
-    tpc_tasks = [(tpc[n][0], tpc[n][1], 10 + 3 * tpc[n][2] / 1000, tpc[n][3]) for n in L if n in tpc]
+    # outer safety kill only: sized for the worst case with a wide margin, so it fires only
+    # for a stuck check (and then every test is kept)
+    tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
-    budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L if n not in tpc}
+    budgets = {idof[n]: max(10.0, 10 * ms[n] / 1000 + 5.0) for n in L if n not in tpc}  # stuck tests only
     wall = 20 + sum(budgets.values()) + sum(t[2] for t in tpc_tasks)
     import resource
 

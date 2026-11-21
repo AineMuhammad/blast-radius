@@ -280,21 +280,26 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
     for i in indices:
         names.update(prof["queries"][i].get("tables", []))
     tables = load_tables(data_dir, ds, sorted(names)) if names else {}
-    deadline = time.monotonic() + budget
     compile_only = set(compile_only)
     for i in indices:
         meta, sql, optimized = queries[i]
         exp_rec = prof["queries"][i]["out"]
         if i in compile_only and "plan" in (exp_rec or {}):
             rec = run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
-            if rec != {"duck": exp_rec["duck"], "plan": exp_rec["plan"]}:
+            if rec == {"duck": exp_rec["duck"], "plan": exp_rec["plan"]}:
+                continue
+            if rec.get("duck") != exp_rec["duck"]:
+                return False  # DuckDB would compute a different expected answer
+            # the plan changed but the test only compares results: run this query fully
+            rec = run_one(ds, mode, meta, sql, optimized, tables)
+            if {k: v for k, v in rec.items() if k != "plan"} != {k: v for k, v in exp_rec.items() if k != "plan"}:
                 return False
         else:
             rec = run_one(ds, mode, meta, sql, optimized, tables)
             if {k: v for k, v in rec.items() if k != "plan"} != {k: v for k, v in exp_rec.items() if k != "plan"}:
                 return False
-        if time.monotonic() > deadline:
-            return False
+        # no deadline here: the outcome must depend only on outputs. The selector's outer
+        # safety kill (sized for every query running fully) still keeps the test.
     return True
 
 

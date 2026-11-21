@@ -99,3 +99,14 @@ Runtime CPU measured in-container on the samples.
   machine to justify a run-phase TPC-DS check.
 - Samples: **106.587 s** + 4.1 s CPU = 110.6 s, byte-identical runs, 0 misses.
   Fresh 48, 80 random, 39 of the 150-set: 0 misses. Edge cases OK.
+- Board (23e305c): **177.2 s** (174.19 s simulated + 3.05 s CPU), 0 misses.
+
+## v8 — check outcomes depend only on outputs
+- TPC checks have no internal deadline. When a compile-only query's plan differs, that
+  query is run fully and its results compared (the test compares results, not plans).
+- Safety kills are sized for the worst case with a wide margin (TPC: every query runs
+  fully, x5 + 60 s; tests: max(10 s, 10x recorded + 5 s)); when one fires the tests are kept.
+- 80-random set: byte-identical output with the machine idle and fully loaded.
+- Samples 106.587 s; fresh 48: 248.389 s (was 264.502: m02044 drops TPC-DS, CPU-neutral
+  there because every plan changed). 0 misses on samples, fresh, 80 random, 150-set so far.
+- Probe branch `probe-no-tpcds` (74603c4): never schedules TPC-DS, for board measurement only.
