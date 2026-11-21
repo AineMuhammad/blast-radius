@@ -21,6 +21,9 @@ RUN cd /opt/sqlglot \
      python -m pytest -p br_trace -p no:cacheprovider -n 4 -q tests > /build/trace.log 2>&1 || true) \
  && tail -n 3 /build/trace.log
 
+# precompiled bytecode keeps in-container test runs cheap
+RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
+
 COPY tools/build_map.py /build/build_map.py
 RUN PYTHONPATH=/opt/sqlglot python /build/build_map.py /opt/sqlglot /build/trace /app/map \
  && chmod -R a+rX /app

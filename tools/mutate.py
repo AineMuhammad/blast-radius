@@ -153,6 +153,8 @@ for k in range(COUNT):
     cid = f"m{SEED:02d}{k:03d}"
     d = git_header(path, unified(path, old, new))
     open(os.path.join(OUT, "commits", cid + ".patch"), "w").write(d)
+    os.makedirs(os.path.join(OUT, "new"), exist_ok=True)
+    open(os.path.join(OUT, "new", cid), "w").write(new)
     kinds[cid] = kind
 json.dump(kinds, open(os.path.join(OUT, "kinds.json"), "w"), indent=0)
 print("wrote", len(kinds))

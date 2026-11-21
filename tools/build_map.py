@@ -30,12 +30,15 @@ ROOT = ROOT.rstrip("/") + "/"
 def load_traces():
     tests = {}
     imp = defaultdict(set)
+    global import_func_lines
     for f in sorted(glob.glob(os.path.join(TRACE, "trace_*.json"))):
         d = json.load(open(f))
         for k, v in d["tests"].items():
             tests[k] = v
         for k, v in d["import_lines"].items():
             imp[k].update(v)
+        for k, v in d.get("import_func_lines", {}).items():
+            import_func_lines[k].update(v)
     nchild = 0
     for f in sorted(glob.glob(os.path.join(TRACE, "child_*.jsonl"))):
         for line in open(f):
@@ -55,6 +58,7 @@ def load_traces():
     return tests, imp
 
 
+import_func_lines = defaultdict(set)
 tests, import_lines = load_traces()
 if len(tests) < 1600:
     sys.exit(f"only {len(tests)} tests traced; refusing to build an incomplete map")
@@ -133,7 +137,16 @@ def code_objects(co):
             yield from code_objects(c)
 
 
+def names_of(co):
+    r = set(co.co_names) | set(co.co_freevars)
+    for c in co.co_consts:
+        if isinstance(c, str) and c.isidentifier():
+            r.add(c)
+    return r
+
+
 nameref = defaultdict(int)
+IMPNAMES = set()  # names read by function code that ran at import time (metaclasses, factories)
 func_bits = {}  # (file, firstlineno, name) -> bits (tests that ran the code object)
 for f in FILES:
     if f not in TREES:
@@ -143,17 +156,87 @@ for f in FILES:
     except SyntaxError:
         continue
     cf = cov.get(f, {})
+    ifl = import_func_lines.get(f, set())
     for co in code_objects(top):
         if not (co.co_flags & 1):
             continue
+        if ifl and any(ln in ifl for _, _, ln in co.co_lines() if ln is not None):
+            IMPNAMES.update(names_of(co))
         bits = 0
         for _, _, ln in co.co_lines():
             if ln is not None:
                 bits |= cf.get(ln, 0)
         func_bits[(f, co.co_firstlineno, co.co_name)] = bits
         if bits:
-            for n in set(co.co_names) | set(co.co_freevars):
+            for n in names_of(co):
                 nameref[n] |= bits
+
+
+BODY_REFS = defaultdict(set)
+
+
+def _collect_body_refs():
+    for f, tree in TREES.items():
+        if not f.startswith("sqlglot/"):
+            continue
+
+        def walk_body(stmts, qual):
+            for st in stmts:
+                if isinstance(st, ast.ClassDef):
+                    walk_body(st.body, (qual + "." if qual else "") + st.name)
+                    for b in st.bases + st.keywords + st.decorator_list:
+                        for n in ast.walk(b):
+                            _ref(n, f, None)
+                    continue
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in st.decorator_list + st.args.defaults + st.args.kw_defaults:
+                        if d is not None:
+                            for n in ast.walk(d):
+                                _ref(n, f, None)
+                    continue
+                own = assigned_names(st) if qual else set()
+                for n in ast.walk(st):
+                    if isinstance(n, (ast.Lambda, ast.FunctionDef)):
+                        continue
+                    nm = _refname(n)
+                    if nm and nm not in own:
+                        BODY_REFS[nm].add((f, qual or None))
+                    elif nm:
+                        BODY_REFS[nm].add((f, qual))
+
+        walk_body(tree.body, "")
+
+
+def _refname(n):
+    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+        return n.id
+    if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+        return n.attr
+    if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+        return n.value
+    return None
+
+
+def _ref(n, f, qual):
+    nm = _refname(n)
+    if nm:
+        BODY_REFS[nm].add((f, qual))
+
+
+def can_narrow(C, names):
+    """Class-level data names of C whose readers are all visible to static name analysis."""
+    if not names:
+        return False
+    for nm in names:
+        if nm in IMPNAMES or nm.startswith("__"):
+            return False
+        for (g, q) in BODY_REFS.get(nm, ()):
+            if q is None:
+                return False
+            D = resolve(g, q)
+            if D is None or not issubclass(D, C):
+                return False
+    return True
 
 
 def bits_lines(f, a, b):
@@ -290,6 +373,8 @@ def importers_bits(f):
 
 
 def analyse(f):
+    if not BODY_REFS:
+        _collect_body_refs()
     tree = TREES[f]
     n = len(SRC[f].splitlines())
     is_test = f.startswith("tests/")
@@ -324,7 +409,14 @@ def analyse(f):
                     bits = bits_lines(f, a, node.end_lineno)  # lambdas etc inside
                     C = resolve(f, qual) if scope == "c" else None
                     if scope == "c" and is_family(C):
-                        bits |= users_ext(C, f, qual)
+                        names = assigned_names(node)
+                        ub = users_ext(C, f, qual)
+                        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and can_narrow(C, names):
+                            rb = 0
+                            for nm in names:
+                                rb |= nameref.get(nm, 0)
+                            ub &= rb
+                        bits |= ub
                     else:
                         for nm in assigned_names(node):
                             bits |= nameref.get(nm, 0)

@@ -232,11 +232,21 @@ def select_py(fm, hunks):
     return bits
 
 
-def select(mp, patch_text):
-    """-> (bits, force_all)"""
+def select(mp, patch_text, info=None):
+    """-> bits. info (dict) gets 'files' {path: hunks} and 'local_ok' bool."""
     idx = mp.index
     bits = 0
+    if info is not None:
+        info["files"] = {}
+        info["local_ok"] = True
     for f in parse_patch(patch_text):
+        if info is not None:
+            o, nw = f["old"], f["new"]
+            if (o != nw or o in (None, "/dev/null") or f["binary"] or not o.endswith(".py")
+                    or not (o.startswith("sqlglot/") or o.startswith("tests/"))):
+                info["local_ok"] = False
+            else:
+                info["files"][o] = f["hunks"]
         old, new = f["old"], f["new"]
         path = old if old and old != "/dev/null" else new
         if not path or path == "/dev/null":
@@ -268,6 +278,253 @@ def select(mp, patch_text):
     return bits
 
 
+# ------------------------------------------------------------ local runs
+SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
+LOCAL_OVERHEAD_MS = 700  # fork + importing sqlglot, the test modules and patched sources
+LOCAL_FACTOR = 1.0  # local CPU per recorded test second
+# classes whose fixtures start process pools / databases: never run locally
+HEAVY_CLASSES = ("tests/test_optimizer.py::", "tests/test_executor.py::", "tests/test_sqlglotc.py::")
+
+
+def apply_hunks(text, hunks):
+    """Apply parsed hunks to text; None if the context does not match."""
+    old = text.split("\n")
+    out = []
+    i = 0
+    for ostart, ocount, body in hunks:
+        start = ostart - 1 if ocount > 0 else ostart
+        if start < i:
+            return None
+        out.extend(old[i:start])
+        i = start
+        for tag, txt in body:
+            if tag == " " or tag == "-":
+                if i >= len(old) or old[i] != txt:
+                    return None
+                if tag == " ":
+                    out.append(txt)
+                i += 1
+            else:
+                out.append(txt)
+    out.extend(old[i:])
+    return "\n".join(out)
+
+
+def _modname(path):
+    m = path[:-3].replace("/", ".")
+    return m[: -len(".__init__")] if m.endswith(".__init__") else m
+
+
+def _child_run(patched, test_ids, budgets, wfd):
+    import importlib.abc
+    import importlib.util
+    import signal
+    import unittest
+
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(SQLGLOT)
+    sys.path.insert(0, SQLGLOT)
+    try:
+        import site
+
+        site.main()
+    except Exception:
+        pass
+    mods = {_modname(p): (p, src) for p, src in patched.items()}
+
+    class Loader(importlib.abc.SourceLoader):
+        def __init__(self, path, src):
+            self.path, self.src = path, src
+
+        def get_filename(self, fullname):
+            return os.path.join(SQLGLOT, self.path)
+
+        def get_data(self, path):
+            if path == os.path.join(SQLGLOT, self.path):
+                return self.src.encode("utf-8")
+            with open(path, "rb") as f:
+                return f.read()
+
+        def path_stats(self, path):
+            raise OSError  # never use a cached pyc for patched sources
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if name in mods:
+                p, src = mods[name]
+                is_pkg = p.endswith("__init__.py")
+                spec = importlib.util.spec_from_file_location(
+                    name, os.path.join(SQLGLOT, p), loader=Loader(p, src),
+                    submodule_search_locations=[os.path.dirname(os.path.join(SQLGLOT, p))] if is_pkg else None,
+                )
+                return spec
+            return None
+
+    sys.meta_path.insert(0, Finder())
+
+    failed = set()
+    dotted = {}
+    suite = unittest.TestSuite()
+    loader = unittest.TestLoader()
+    for tid in test_ids:
+        f, rest = tid.split("::", 1)
+        name = _modname(f) + "." + rest.replace("::", ".")
+        dotted[name] = tid
+        try:
+            suite.addTests(loader.loadTestsFromName(name))
+        except BaseException:
+            failed.add(tid)
+    by_class = {}
+    for name, tid in dotted.items():
+        by_class.setdefault(name.rsplit(".", 1)[0], []).append(tid)
+
+    class Timeout(BaseException):
+        pass
+
+    def on_alarm(signum, frame):
+        raise Timeout()
+
+    signal.signal(signal.SIGALRM, on_alarm)
+
+    def mark(test):
+        tid = getattr(test, "id", lambda: "")()
+        if tid in dotted:
+            failed.add(dotted[tid])
+            return
+        # subtests / class or module fixtures
+        base = getattr(test, "test_case", None)
+        if base is not None and base.id() in dotted:
+            failed.add(dotted[base.id()])
+            return
+        desc = str(test)
+        hit = False
+        for cls, tids in by_class.items():
+            if cls in desc or cls.rsplit(".", 1)[0] in desc:
+                failed.update(tids)
+                hit = True
+        if not hit:
+            failed.update(dotted.values())
+
+    class Result(unittest.TestResult):
+        def startTest(self, test):
+            super().startTest(test)
+            b = budgets.get(dotted.get(test.id()), 5.0)
+            signal.setitimer(signal.ITIMER_REAL, b)
+
+        def stopTest(self, test):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            super().stopTest(test)
+
+        def addError(self, test, err):
+            mark(test)
+
+        def addFailure(self, test, err):
+            mark(test)
+
+        def addSubTest(self, test, subtest, err):
+            if err is not None:
+                mark(test)
+
+        def addUnexpectedSuccess(self, test):
+            mark(test)
+
+    devnull = open(os.devnull, "w")
+    sys.stdout = devnull
+    sys.stderr = devnull
+    res = Result()
+    try:
+        suite.run(res)
+    except BaseException:
+        failed.update(dotted.values())
+    os.write(wfd, json.dumps(sorted(failed)).encode())
+
+
+def run_local(patched, test_ids, budgets, wall_limit):
+    """Run tests on the patched tree in a forked child. -> set of failing ids, or None."""
+    import select as _select
+    import signal
+    import time
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        code = 0
+        try:
+            os.close(r)
+            _child_run(patched, test_ids, budgets, w)
+        except BaseException:
+            code = 1
+        finally:
+            os._exit(code)
+    os.close(w)
+    chunks = []
+    deadline = time.monotonic() + wall_limit
+    ok = True
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            ok = False
+            break
+        rl, _, _ = _select.select([r], [], [], left)
+        if not rl:
+            ok = False
+            break
+        b = os.read(r, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(r)
+    if not ok:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    _, status = os.waitpid(pid, 0)
+    if not ok or status != 0:
+        return None
+    try:
+        return set(json.loads(b"".join(chunks).decode()))
+    except Exception:
+        return None
+
+
+def pack_cost(ms_list):
+    if not ms_list:
+        return 0
+    ms_list = sorted(ms_list, reverse=True)
+    best = None
+    total = sum(ms_list)
+    for k in range(1, min(MAX_WORKERS, len(ms_list)) + 1):
+        loads = [0] * k
+        for m in ms_list:
+            loads[loads.index(min(loads))] += m
+        c = max(loads) + WORKER_MS * k
+        best = c if best is None else min(best, c)
+    return best
+
+
+def plan_local(nums, ms, idof):
+    """Choose the locally-run subset minimizing expected cost (assuming tests pass)."""
+    elig = sorted((n for n in nums if not idof[n].startswith(HEAVY_CLASSES)), key=lambda n: ms[n])
+    if not elig:
+        return []
+    base = pack_cost([ms[n] for n in nums])
+    best, best_k = base, 0
+    rest_sorted = sorted((ms[n] for n in nums), reverse=True)
+    acc = 0
+    elig_set = set()
+    for k, n in enumerate(elig, 1):
+        acc += ms[n]
+        elig_set.add(n)
+        if k < len(elig) and ms[elig[k]] == ms[n]:
+            continue
+        remaining = [ms[m] for m in nums if m not in elig_set]
+        c = pack_cost(remaining) + LOCAL_OVERHEAD_MS + LOCAL_FACTOR * acc
+        if c < best - 200:
+            best, best_k = c, k
+    return elig[:best_k]
+
+
 # ---------------------------------------------------------------- packing
 def pack(items):
     """items: list of (ms, number). -> list of workers minimizing max + 2s*k (LPT per k)."""
@@ -294,6 +551,36 @@ def pack(items):
     return [w for w in best[1] if w]
 
 
+def refine_local(info, nums, ms, idof):
+    L = plan_local(nums, ms, idof)
+    if not L:
+        return nums
+    patched = {}
+    for path, hunks in info["files"].items():
+        with open(os.path.join(SQLGLOT, path), encoding="utf-8") as f:
+            new = apply_hunks(f.read(), hunks)
+        if new is None:
+            return nums
+        patched[path] = new
+    ids = [idof[n] for n in L]
+    budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L}
+    wall = 20 + sum(budgets.values())
+    import resource
+
+    c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    failed = run_local(patched, ids, budgets, wall)
+    c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    log(f"local cpu {(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime):.3f}s, "
+        f"recorded {sum(ms[n] for n in L) / 1000:.3f}s")
+    if failed is None:
+        return nums
+    keep = set(nums) - set(L)
+    num_of = {idof[n]: n for n in L}
+    keep.update(num_of[t] for t in failed if t in num_of)
+    log(f"local: ran {len(L)} tests, {len(failed)} failed, kept {len(keep)} of {len(nums)}")
+    return keep
+
+
 def main():
     with open(os.path.join(DATA, "tests.json")) as f:
         tj = json.load(f)
@@ -308,6 +595,8 @@ def main():
     if always:
         log(f"{len(always)} tests without trace data, always selected")
 
+    idof = {t["number"]: t["id"] for t in tests}
+    local_enabled = os.environ.get("BR_LOCAL", "1") == "1" and os.path.isdir(SQLGLOT)
     cdir = os.path.join(DATA, "commits")
     out = []
     for name in sorted(os.listdir(cdir)):
@@ -317,7 +606,8 @@ def main():
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
-            bits = select(mp, text)
+            info = {}
+            bits = select(mp, text, info)
             nums = set(always)
             i = 0
             while bits:
@@ -330,6 +620,11 @@ def main():
         except Exception as e:  # never fail: run everything
             log(f"{cid}: error {e!r}, selecting all")
             nums = set(ms)
+        if local_enabled and nums and info.get("local_ok"):
+            try:
+                nums = refine_local(info, nums, ms, idof)
+            except Exception as e:
+                log(f"{cid}: local run skipped ({e!r})")
         workers = pack([(ms[n], n) for n in nums])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))

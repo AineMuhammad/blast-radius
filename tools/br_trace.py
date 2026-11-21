@@ -29,6 +29,7 @@ _cur_files = None
 _cur_dirs = None
 _cur_types = None
 _import_lines = {}
+_import_func_lines = {}  # function code run outside any test (imports, metaclasses, collection)
 _results = {}
 
 
@@ -47,6 +48,11 @@ def _line_cb(code, line):
                 s = _cur_lines.get(rel)
                 if s is None:
                     s = _cur_lines[rel] = set()
+                s.add(line)
+            else:
+                s = _import_func_lines.get(rel)
+                if s is None:
+                    s = _import_func_lines[rel] = set()
                 s.add(line)
         else:
             s = _import_lines.get(rel)
@@ -307,6 +313,10 @@ def pytest_unconfigure(config):
     wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(os.path.join(OUT, f"trace_{wid}.json"), "w") as f:
         json.dump(
-            {"tests": _results, "import_lines": {k: sorted(v) for k, v in _import_lines.items()}},
+            {
+                "tests": _results,
+                "import_lines": {k: sorted(v) for k, v in _import_lines.items()},
+                "import_func_lines": {k: sorted(v) for k, v in _import_func_lines.items()},
+            },
             f,
         )

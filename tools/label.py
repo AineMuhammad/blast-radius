@@ -84,7 +84,8 @@ for cid in sorted(kinds):
     full = os.path.join(ROOT, path)
     orig = open(full).read()
     try:
-        open(full, "w").write(apply(full, patch))
+        newp = os.path.join(SET, "new", cid)
+        open(full, "w").write(open(newp).read() if os.path.exists(newp) else apply(full, patch))
         for f in os.listdir("/tmp"):
             if f.startswith("label_out"):
                 os.remove(os.path.join("/tmp", f))
