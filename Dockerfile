@@ -24,8 +24,13 @@ RUN cd /opt/sqlglot \
 # precompiled bytecode keeps in-container test runs cheap
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
+# per-query model of the TPC executor tests: coverage, cost and unpatched outputs
+COPY tools/tpc.py /app/tpc.py
+RUN cd /opt/sqlglot && SKIP_INTEGRATION=0 python /app/tpc.py profile /opt/sqlglot /app/tpcdata
+
 COPY tools/build_map.py /build/build_map.py
-RUN PYTHONPATH=/opt/sqlglot python /build/build_map.py /opt/sqlglot /build/trace /app/map \
+RUN PYTHONPATH=/opt/sqlglot python /build/build_map.py /opt/sqlglot /build/trace /app/map /app/tpcdata/profile.json \
+ && rm /app/tpcdata/profile.json \
  && chmod -R a+rX /app
 
 COPY selector.py /app/selector.py

@@ -30,6 +30,7 @@ _cur_dirs = None
 _cur_types = None
 _import_lines = {}
 _import_func_lines = {}  # function code run outside any test (imports, metaclasses, collection)
+_import_types = set()  # sqlglot classes instantiated outside any test
 _results = {}
 
 
@@ -119,16 +120,16 @@ def _hook_classes():
             if "__init__" in c.__dict__ and c not in seen:
                 seen.add(c)
                 orig = c.__dict__["__init__"]
-                if not callable(orig):
+                if not callable(orig) or getattr(orig, "_br_hooked", False):
                     continue
 
                 def make(orig):
                     def __init__(self, *a, **k):
-                        if _cur_types is not None:
-                            _cur_types.add(type(self))
+                        (_cur_types if _cur_types is not None else _import_types).add(type(self))
                         return orig(self, *a, **k)
 
                     __init__.__wrapped__ = orig
+                    __init__._br_hooked = True
                     return __init__
 
                 try:
@@ -147,7 +148,9 @@ def _import_everything():
             importlib.import_module(info.name)
         except Exception:
             pass
-    # dialect classes are lazily loaded through Dialect registry
+    # dialect classes are lazily loaded through Dialect registry; instances made here are
+    # the tracer's doing, not sqlglot's import-time behaviour
+    snapshot = set(_import_types)
     try:
         from sqlglot.dialects.dialect import Dialects, Dialect
 
@@ -159,6 +162,8 @@ def _import_everything():
                     pass
     except Exception:
         pass
+    _import_types.clear()
+    _import_types.update(snapshot)
 
 
 _installed = False
@@ -174,8 +179,11 @@ def _install():
     M.register_callback(TOOL, M.events.LINE, _line_cb)
     M.set_events(TOOL, M.events.LINE)
     sys.addaudithook(_audit)
-    _import_everything()
+    import sqlglot  # noqa: F401  core modules, so instances made while importing the rest are seen
+
     _hook_classes()
+    _import_everything()
+    _hook_classes()  # classes defined by the lazily imported modules
 
 
 def _child_record(test_id, payload):
@@ -317,6 +325,8 @@ def pytest_unconfigure(config):
                 "tests": _results,
                 "import_lines": {k: sorted(v) for k, v in _import_lines.items()},
                 "import_func_lines": {k: sorted(v) for k, v in _import_func_lines.items()},
+                "import_types": sorted({_qual(c) for t in _import_types for c in t.__mro__
+                                        if c.__module__.startswith("sqlglot")}),
             },
             f,
         )

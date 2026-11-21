@@ -30,7 +30,7 @@ ROOT = ROOT.rstrip("/") + "/"
 def load_traces():
     tests = {}
     imp = defaultdict(set)
-    global import_func_lines
+    global import_func_lines, import_types
     for f in sorted(glob.glob(os.path.join(TRACE, "trace_*.json"))):
         d = json.load(open(f))
         for k, v in d["tests"].items():
@@ -39,6 +39,7 @@ def load_traces():
             imp[k].update(v)
         for k, v in d.get("import_func_lines", {}).items():
             import_func_lines[k].update(v)
+        import_types.update(d.get("import_types", []))
     nchild = 0
     for f in sorted(glob.glob(os.path.join(TRACE, "child_*.jsonl"))):
         for line in open(f):
@@ -59,10 +60,29 @@ def load_traces():
 
 
 import_func_lines = defaultdict(set)
+import_types = set()  # qualnames (with bases) of sqlglot classes instantiated while importing
 tests, import_lines = load_traces()
-if len(tests) < 1600:
+if len(tests) < 1600:  # real tests only
     sys.exit(f"only {len(tests)} tests traced; refusing to build an incomplete map")
-ids = sorted(tests)
+# Each TPC query of the heavy executor tests becomes a pseudo-test ("@tpc:<test>#<i>")
+# so every rule below also tells which queries a change can reach. "#setup" holds
+# code shared by all queries; "#unmodelled" holds lines the real test runs that no
+# query model reaches. A change hitting either needs the real test.
+PROFILE = sys.argv[4] if len(sys.argv) > 4 else None
+pseudo = {}
+if PROFILE and os.path.exists(PROFILE):
+    _prof = json.load(open(PROFILE))
+    for tid, v in _prof.items():
+        if tid not in tests:
+            continue
+        for qi, q in enumerate(v["queries"]):
+            pseudo[f"@tpc:{tid}#{qi}"] = {"lines": q["lines"], "classes": q.get("classes", [])}
+            if q.get("out") and "plan" in q["out"]:
+                # run phase only (PythonExecutor and result pickling): needs a full run
+                pseudo[f"@tpc:{tid}#{qi}R"] = {"lines": q["run_lines"], "classes": q["run_classes"]}
+        pseudo[f"@tpc:{tid}#setup"] = {"lines": v["setup_lines"], "classes": v.get("setup_classes", [])}
+        pseudo[f"@tpc:{tid}#unmodelled"] = {"lines": {}, "classes": []}
+ids = sorted(tests) + sorted(pseudo)
 IDX = {t: i for i, t in enumerate(ids)}
 ALL = (1 << len(ids)) - 1
 
@@ -79,6 +99,11 @@ for t, v in tests.items():
     su["classes"].update(s["classes"])
 
 cov = defaultdict(lambda: defaultdict(int))  # file -> line -> bits
+for pid, pv in pseudo.items():
+    pb = 1 << IDX[pid]
+    for f_, ls in pv["lines"].items():
+        for l in ls:
+            cov[f_][l] |= pb
 data_files = defaultdict(int)
 data_dirs = defaultdict(int)
 class_users = defaultdict(int)
@@ -100,6 +125,27 @@ for t, v in tests.items():
     for x in set(c["classes"]) | su["classes"]:
         class_users[x] |= b
 
+for pid, pv in pseudo.items():
+    for x in pv["classes"]:
+        class_users[x] |= 1 << IDX[pid]
+
+# lines the real heavy test runs that none of its query models reach
+for tid in {p.split("#")[0][5:] for p in pseudo}:
+    tb = 1 << IDX[tid]
+    qbits = 0
+    for p in pseudo:
+        if p.startswith(f"@tpc:{tid}#"):
+            qbits |= 1 << IDX[p]
+    ub = 1 << IDX[f"@tpc:{tid}#unmodelled"]
+    n_un = 0
+    for f_, lines in cov.items():
+        if not f_.startswith("sqlglot/"):
+            continue
+        for l, b in lines.items():
+            if b & tb and not b & qbits:
+                lines[l] = b | ub
+                n_un += 1
+    print(f"{tid.split('::')[-1]}: {n_un} lines not reached by any query model", file=sys.stderr)
 
 # --- static analysis --------------------------------------------------------
 def py_files():
@@ -160,8 +206,6 @@ for f in FILES:
     for co in code_objects(top):
         if not (co.co_flags & 1):
             continue
-        if ifl and any(ln in ifl for _, _, ln in co.co_lines() if ln is not None):
-            IMPNAMES.update(names_of(co))
         bits = 0
         for _, _, ln in co.co_lines():
             if ln is not None:
@@ -227,8 +271,11 @@ def can_narrow(C, names):
     """Class-level data names of C whose readers are all visible to static name analysis."""
     if not names:
         return False
+    related = [C] + list(DIALECT_OF.get(C, []))
     for nm in names:
-        if nm in IMPNAMES or nm.startswith("__"):
+        if nm.startswith("__") or nm in IMPNAMES_META:
+            return False
+        if nm in IMPNAMES and any(made_at_import(X) for X in related):
             return False
         for (g, q) in BODY_REFS.get(nm, ()):
             if q is None:
@@ -237,6 +284,87 @@ def can_narrow(C, names):
             if D is None or not issubclass(D, C):
                 return False
     return True
+
+
+def _line_names(tree):
+    """line -> names referenced on it (attribute names at the attribute's last line)."""
+    out = defaultdict(set)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute):
+            out[n.end_lineno].add(n.attr)
+        elif isinstance(n, ast.Name):
+            out[n.lineno].add(n.id)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+            for l in range(n.lineno, n.end_lineno + 1):
+                out[l].add(n.value)
+    return out
+
+
+def _func_kinds(tree):
+    """line -> True if it belongs to class-creation code (metaclass, __init_subclass__)."""
+    meta = {}
+
+    def walk(node, in_meta_cls):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, ast.ClassDef):
+                is_meta = any(isinstance(b, ast.Name) and b.id in ("type", "ABCMeta") or
+                              isinstance(b, ast.Attribute) and b.attr in ("ABCMeta",) for b in ch.bases)
+                walk(ch, is_meta)
+            elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                m = in_meta_cls or ch.name in ("__new__", "__init_subclass__", "__set_name__", "__prepare__")
+                for l in range(ch.lineno, ch.end_lineno + 1):
+                    meta[l] = m  # inner functions overwrite below
+                walk(ch, in_meta_cls)
+            else:
+                walk(ch, in_meta_cls)
+
+    walk(tree, False)
+    return meta
+
+
+# names read on lines that actually ran at import time, split by who read them:
+# class-creation code derives per-class state from them (never narrowed); other code
+# reads them from the few objects that exist at import (narrowed unless such an object
+# is an instance of the edited class)
+IMPNAMES_META = set()
+for _f, _ls in import_func_lines.items():
+    if _f in TREES and _f.startswith("sqlglot/"):
+        _ln = _line_names(TREES[_f])
+        _mk = _func_kinds(TREES[_f])
+        for _l in _ls:
+            names_here = _ln.get(_l, ())
+            IMPNAMES.update(names_here)
+            if _mk.get(_l, True):
+                IMPNAMES_META.update(names_here)
+
+
+def _resolve_qual(full):
+    parts = full.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        try:
+            o = importlib.import_module(".".join(parts[:i]))
+        except Exception:
+            continue
+        try:
+            for p in parts[i:]:
+                o = getattr(o, p)
+            return o if isinstance(o, type) else None
+        except AttributeError:
+            return None
+    return None
+
+
+IMPORT_CLASSES = None
+
+
+def made_at_import(C):
+    """Was an instance of C (or a subclass) created while importing sqlglot?"""
+    global IMPORT_CLASSES
+    if IMPORT_CLASSES is None:
+        IMPORT_CLASSES = [c for c in (_resolve_qual(q) for q in import_types) if c is not None]
+    if not import_types:
+        return True  # old trace without the data: assume yes
+    return any(issubclass(c, C) for c in IMPORT_CLASSES)
 
 
 def bits_lines(f, a, b):
@@ -383,6 +511,14 @@ def analyse(f):
     best = [None] * (n + 2)  # (size, bits)
     gap_blocks = []  # (body_start, body_end, indent, header_bits)
 
+    docstrings = set()
+    for nd in ast.walk(tree):
+        if isinstance(nd, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and nd.body:
+            b0 = nd.body[0]
+            if isinstance(b0, ast.Expr) and isinstance(b0.value, ast.Constant) and isinstance(b0.value.value, str):
+                docstrings.add(id(b0))
+    doc_bits = nameref.get("__doc__", 0) | nameref.get("getdoc", 0)
+
     def visit(stmts, scope, qual, func_bits_here):
         """scope: 'm' module, 'c' class, 'f' function. func_bits_here: bits of enclosing function."""
         for i, node in enumerate(stmts):
@@ -391,14 +527,21 @@ def analyse(f):
                 a = min([a] + [d.lineno for d in node.decorator_list])
             compound = hasattr(node, "body") and isinstance(getattr(node, "body"), list)
             hend = header_end(node) if compound else node.end_lineno
-            if scope == "f":
+            if id(node) in docstrings:
+                # only observable through __doc__
+                bits = doc_bits
+            elif scope == "f":
                 bits = bits_lines(f, a, hend)
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     bits |= bits_lines(f, a, node.end_lineno)
             else:
                 # import-time statement
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    bits = bits_lines(f, a, node.end_lineno) | nameref.get(node.name, 0)
+                    # signature / default / decorator changes only matter when the function
+                    # runs, and running it executes its body
+                    bits = bits_lines(f, a, node.end_lineno)
+                    if not bits:
+                        bits = nameref.get(node.name, 0) if not node.name.startswith("__") else 0
                 elif isinstance(node, ast.ClassDef):
                     q = (qual + "." if qual else "") + node.name
                     C = resolve(f, q)
@@ -427,9 +570,13 @@ def analyse(f):
                 if is_test:
                     bits |= importers_bits(f) if scope == "m" else test_file_bits.get(f, 0)
             size = hend - a
+            if scope == "f":
+                span = (a, node.end_lineno) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else (a, hend)
+            else:
+                span = None  # import-time: no per-query attribution
             for l in range(a, min(hend, n) + 1):
                 if best[l] is None or best[l][0] >= size:
-                    best[l] = (size, bits)
+                    best[l] = (size, bits, span)
             if compound:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     fb = bits_lines(f, a, node.end_lineno)
@@ -454,7 +601,7 @@ def analyse(f):
                     hbits = bits_lines(f, h.lineno, he) if scope == "f" else bits
                     for l in range(h.lineno, he + 1):
                         if best[l] is None or best[l][0] >= he - h.lineno:
-                            best[l] = (he - h.lineno, hbits | bits)
+                            best[l] = (he - h.lineno, hbits | bits, (h.lineno, he) if scope == "f" else None)
                     lists.append(h.body)
                 for c in getattr(node, "cases", []) or []:
                     lists.append(c.body)
@@ -464,7 +611,7 @@ def analyse(f):
                 # lines inside the node not owned by a child statement (else:, try:, finally:)
                 for l in range(a, min(node.end_lineno, n) + 1):
                     if best[l] is None:
-                        best[l] = (node.end_lineno - a, hb)
+                        best[l] = (node.end_lineno - a, hb, (a, hend) if scope == "f" else None)
 
     top_bits = importers_bits(f) if is_test else 0
     gap_blocks.append((1, n, 0, top_bits))
@@ -498,11 +645,13 @@ def analyse(f):
                 if not closer.match(rest):
                     continue
             if best[l] is not None:
-                best[l] = (best[l][0], lb)
+                best[l] = (best[l][0], lb, (node.lineno, node.end_lineno))
 
+    SPAN = [None] * (n + 2)
     for l in range(1, n + 1):
         if best[l] is not None:
             M[l] = best[l][1]
+            SPAN[l] = best[l][2]
 
     # strings spanning lines
     strlines = set()
@@ -532,7 +681,7 @@ def analyse(f):
                 encl.append((ind, hb))
         encl.sort()
         gaps.append((prev_b or 0, next_b or 0, encl))
-    return M, gaps, sorted(strlines)
+    return M, gaps, sorted(strlines), SPAN
 
 
 def to_hex(b):
@@ -540,11 +689,27 @@ def to_hex(b):
 
 
 os.makedirs(OUT, exist_ok=True)
-index = {"tests": ids, "files": {}, "data": {}, "dirs": {}, "testfile": {}}
+index = {"tests": ids, "files": {}, "data": {}, "dirs": {}, "testfile": {}, "heavy": {}}
+if PROFILE and os.path.exists(PROFILE):
+    pdir = os.path.dirname(PROFILE)
+    for tid, v in json.load(open(PROFILE)).items():
+        if tid in IDX:
+            index["heavy"][tid] = {
+                "cpu": [q["cpu"] for q in v["queries"]],
+                "cpu_compile": [q.get("cpu_compile") for q in v["queries"]],
+                "tables": [q["tables"] for q in v["queries"]],
+            }
+    sizes = {}
+    for ds in ("tpch", "tpcds"):
+        d = os.path.join(pdir, ds)
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                sizes[f"{ds}/{fn[:-4]}"] = os.path.getsize(os.path.join(d, fn))
+    index["table_bytes"] = sizes
 for i, f in enumerate(FILES):
     if f not in TREES:
         continue
-    M, gaps, strl = analyse(f)
+    M, gaps, strl, SPAN = analyse(f)
     groups = {}
 
     def gi(b):

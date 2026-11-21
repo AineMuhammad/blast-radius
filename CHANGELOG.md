@@ -21,3 +21,20 @@ Runtime CPU measured in-container on the samples.
   Run only when the expected saving (50% failure assumption) beats the measured CPU cost.
 - Samples: **162.551 s** simulated, 0 misses, CPU 5.5–6.3 s (measured while the machine was busy).
 - 25 generated mutants: 82.7 s simulated + 3.8 s CPU, 0 misses (v1: 102.1 s).
+- Board (5516f32): **182.9 s**, 0 misses.
+
+## v3 — TPC query models, sharper class-level rules
+- TPC executor tests modelled per query (pseudo-tests in the map). A change reaching few
+  queries is checked by re-running only those; a change reaching only compile-time code
+  (parser, optimizer, planner) is checked by comparing a canonical digest of the execution
+  plan and the generated DuckDB SQL with the unpatched outputs, without executing.
+  TPC-H tests are checked almost for free.
+- Function signature/default/decorator edits select the tests that run the function,
+  not every reference to its name.
+- Docstring edits select only code that reads `__doc__`.
+- Settings read at import time are narrowed unless read by class-creation code or from an
+  instance of the edited class made during import (tracer now records those instances).
+- Wall-clock cap for local runs.
+- Samples: **162.551 s** + 3.7 s CPU, 0 misses (3 identical runs).
+- 80 generated mutants: **357.7 s** + 16.7 s CPU, 0 misses (v2: 457.2 s + 5.5 s).
+- Clean build: 3.6 min on 4 cores.

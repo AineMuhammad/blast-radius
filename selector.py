@@ -280,8 +280,16 @@ def select(mp, patch_text, info=None):
 
 # ------------------------------------------------------------ local runs
 SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
-LOCAL_OVERHEAD_MS = 500  # fork + importing sqlglot, the test modules and patched sources
-LOCAL_FACTOR = 1.4  # local CPU per recorded test second (measured, includes per-test imports)
+TPC_DIR = os.environ.get("BR_TPC", "/app/tpcdata")
+HERE = os.path.dirname(os.path.abspath(__file__))  # tpc.py lives next to this file
+TPC_FACTOR = 1.2  # run-time CPU per profiled query second
+TPC_LOAD_MS_PER_MB = 25  # loading pre-parsed TPC tables
+TPC_FAIL_FRACTION = 0.25  # a broken query model stops at the first mismatch
+# wall-clock budget for all local runs (the batch has 180 s, the final 270 s for ~1.5x commits)
+LOCAL_WALL_PER_COMMIT = 2.5
+LOCAL_WALL_MAX = 150.0
+LOCAL_OVERHEAD_MS = 500  # fork, imports, patched sources; deliberately above the measured 0.2 s
+LOCAL_FACTOR = 1.4  # local CPU per recorded test second (measured 1.15; margin pays off)
 LOCAL_P_FAIL = float(os.environ.get("BR_PFAIL", "0.5"))  # chance a locally run selection contains a failure (then little is saved)
 # stdlib modules sqlglot and unittest import: loaded once in the parent, shared by forks
 PRELOAD = ("unittest", "importlib.abc", "importlib.util", "signal", "typing", "re", "enum",
@@ -336,7 +344,7 @@ def _modname(path):
     return m[: -len(".__init__")] if m.endswith(".__init__") else m
 
 
-def _child_run(patched, test_ids, budgets, wfd):
+def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=()):
     import importlib.abc
     import importlib.util
     import signal
@@ -446,6 +454,19 @@ def _child_run(patched, test_ids, budgets, wfd):
     devnull = open(os.devnull, "w")
     sys.stdout = devnull
     sys.stderr = devnull
+    for tid, indices, budget, compile_only in tpc_tasks:
+        try:
+            sys.path.insert(0, HERE)
+            import tpc
+
+            signal.setitimer(signal.ITIMER_REAL, budget)
+            ok = tpc.check(TPC_DIR, tid, indices, budget, compile_only)
+        except BaseException:
+            ok = False
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        if not ok:
+            failed.add(tid)
     res = Result()
     try:
         suite.run(res)
@@ -454,7 +475,7 @@ def _child_run(patched, test_ids, budgets, wfd):
     os.write(wfd, json.dumps(sorted(failed)).encode())
 
 
-def run_local(patched, test_ids, budgets, wall_limit):
+def run_local(patched, test_ids, budgets, wall_limit, tpc_tasks=()):
     """Run tests on the patched tree in a forked child. -> set of failing ids, or None."""
     import select as _select
     import signal
@@ -466,7 +487,7 @@ def run_local(patched, test_ids, budgets, wall_limit):
         code = 0
         try:
             os.close(r)
-            _child_run(patched, test_ids, budgets, w)
+            _child_run(patched, test_ids, budgets, w, tpc_tasks)
         except BaseException:
             code = 1
         finally:
@@ -518,28 +539,41 @@ def pack_cost(ms_list):
     return best
 
 
-def plan_local(nums, ms, idof):
-    """Choose the locally-run subset minimizing expected cost (assuming tests pass)."""
-    elig = sorted((n for n in nums if not idof[n].startswith(HEAVY_CLASSES)), key=lambda n: ms[n])
-    if not elig:
+def plan_local(nums, ms, idof, extra_cost=None, extra_fail=None):
+    """Choose the locally-run subset maximizing expected saving.
+
+    extra_cost: {test number: local CPU ms} for tests checked by a model (TPC queries)
+    instead of being run whole.
+    """
+    extra_cost = extra_cost or {}
+    extra_fail = extra_fail or {}
+    cand = []
+    fail_cost = {}
+    for n in nums:
+        if n in extra_cost:
+            cand.append((extra_cost[n], n))
+            fail_cost[n] = extra_fail.get(n, extra_cost[n])
+        elif not idof[n].startswith(HEAVY_CLASSES):
+            cand.append((LOCAL_FACTOR * ms[n], n))
+            fail_cost[n] = LOCAL_FACTOR * ms[n]
+    if not cand:
         return []
+    # cheapest local cost per scheduled second first
+    cand.sort(key=lambda x: (x[0] / max(ms[x[1]], 1), x[0]))
     base = pack_cost([ms[n] for n in nums])
-    best, best_k = 0, 0  # best expected saving
-    rest_sorted = sorted((ms[n] for n in nums), reverse=True)
-    acc = 0
-    elig_set = set()
-    for k, n in enumerate(elig, 1):
-        acc += ms[n]
-        elig_set.add(n)
-        if k < len(elig) and ms[elig[k]] == ms[n]:
-            continue
-        remaining = [ms[m] for m in nums if m not in elig_set]
-        cpu = LOCAL_OVERHEAD_MS + LOCAL_FACTOR * acc
-        # pass: pay cpu + rest; fail: pay cpu and (about) the full schedule
+    best, best_k = 0, 0
+    chosen = set()
+    acc = acc_fail = 0
+    for k, (c, n) in enumerate(cand, 1):
+        acc += c
+        acc_fail += fail_cost[n]
+        chosen.add(n)
+        remaining = [ms[m] for m in nums if m not in chosen]
+        cpu = LOCAL_OVERHEAD_MS + (1 - LOCAL_P_FAIL) * acc + LOCAL_P_FAIL * acc_fail
         saving = (1 - LOCAL_P_FAIL) * (base - pack_cost(remaining)) - cpu
         if saving > best + 100:
             best, best_k = saving, k
-    return elig[:best_k]
+    return [n for _, n in cand[:best_k]]
 
 
 # ---------------------------------------------------------------- packing
@@ -568,8 +602,40 @@ def pack(items):
     return [w for w in best[1] if w]
 
 
-def refine_local(info, nums, ms, idof):
-    L = plan_local(nums, ms, idof)
+def tpc_plans(mp, qbits, nums, by_id):
+    """{test number: (test id, query indices, est ms)} for heavy tests checkable by queries."""
+    out = {}
+    heavy = mp.index.get("heavy", {})
+    if not heavy or not os.path.isdir(TPC_DIR):
+        return out
+    for tid, h in heavy.items():
+        n = by_id.get(tid)
+        if n is None or n not in nums:
+            continue
+        sel = qbits.get(tid)
+        if not sel or sel.get("bad") or not sel.get("q"):
+            continue
+        q = sorted(sel["q"] | sel["run"])
+        cc = h.get("cpu_compile") or [None] * len(h["cpu"])
+        compile_only = [i for i in q if i not in sel["run"] and cc[i] is not None]
+        full = [i for i in q if i not in compile_only]
+        names = set()
+        for i in full:
+            names.update(h["tables"][i])
+        for i in compile_only:
+            names.update(h["tables"][i])  # find_tables / ensure_tables still see them
+        ds = "tpch" if "tpch" in tid else "tpcds"
+        mb = sum(mp.index.get("table_bytes", {}).get(f"{ds}/{t}", 0) for t in names) / 1e6
+        cpu = sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)
+        est = TPC_FACTOR * 1000 * cpu + TPC_LOAD_MS_PER_MB * mb + 50
+        out[n] = (tid, q, est, compile_only)
+    return out
+
+
+def refine_local(info, nums, ms, idof, tpc=None):
+    tpc = tpc or {}
+    L = plan_local(nums, ms, idof, {n: v[2] for n, v in tpc.items()},
+                   {n: TPC_FAIL_FRACTION * v[2] for n, v in tpc.items()})
     if not L:
         return nums
     patched = {}
@@ -580,13 +646,14 @@ def refine_local(info, nums, ms, idof):
             return nums
         patched[path] = new
     _preload()
-    ids = [idof[n] for n in L]
-    budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L}
-    wall = 20 + sum(budgets.values())
+    tpc_tasks = [(tpc[n][0], tpc[n][1], 10 + 3 * tpc[n][2] / 1000, tpc[n][3]) for n in L if n in tpc]
+    ids = [idof[n] for n in L if n not in tpc]
+    budgets = {idof[n]: max(3.0, 5 * ms[n] / 1000 + 2.0) for n in L if n not in tpc}
+    wall = 20 + sum(budgets.values()) + sum(t[2] for t in tpc_tasks)
     import resource
 
     c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    failed = run_local(patched, ids, budgets, wall)
+    failed = run_local(patched, ids, budgets, wall, tpc_tasks)
     c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     log(f"local cpu {(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime):.3f}s, "
         f"recorded {sum(ms[n] for n in L) / 1000:.3f}s")
@@ -595,7 +662,8 @@ def refine_local(info, nums, ms, idof):
     keep = set(nums) - set(L)
     num_of = {idof[n]: n for n in L}
     keep.update(num_of[t] for t in failed if t in num_of)
-    log(f"local: ran {len(L)} tests, {len(failed)} failed, kept {len(keep)} of {len(nums)}")
+    log(f"local: ran {len(L)} tests ({len(tpc_tasks)} by TPC queries), {len(failed)} failed, "
+        f"kept {len(keep)} of {len(nums)}")
     return keep
 
 
@@ -608,39 +676,65 @@ def main():
     mp = Map(MAP_DIR)
     ids = mp.index["tests"]
     bit2num = [by_id.get(t) for t in ids]
+    # pseudo-tests "@tpc:<test>#<query>|setup|unmodelled" -> (test, query index or None)
+    pseudo = {}
+    for i, t in enumerate(ids):
+        if t.startswith("@tpc:"):
+            tid, _, q = t[5:].rpartition("#")
+            if q.isdigit():
+                pseudo[i] = (tid, int(q), False)
+            elif q.endswith("R") and q[:-1].isdigit():
+                pseudo[i] = (tid, int(q[:-1]), True)  # reaches the run phase
+            else:
+                pseudo[i] = (tid, None, False)
     known = set(n for n in bit2num if n is not None)
     always = [t["number"] for t in tests if t["number"] not in known]
     if always:
         log(f"{len(always)} tests without trace data, always selected")
 
     idof = {t["number"]: t["id"] for t in tests}
+    import time
+
     local_enabled = os.environ.get("BR_LOCAL", "1") == "1" and os.path.isdir(SQLGLOT)
     cdir = os.path.join(DATA, "commits")
     out = []
+    n_commits = sum(1 for x in os.listdir(cdir) if x.endswith(".patch"))
+    wall_budget = min(LOCAL_WALL_MAX, LOCAL_WALL_PER_COMMIT * n_commits)
+    t_start = time.monotonic()
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
         cid = name[: -len(".patch")]
+        info, qbits = {}, {}
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
-            info = {}
             bits = select(mp, text, info)
             nums = set(always)
+            qbits = {}
             i = 0
             while bits:
                 if bits & 1:
                     nm = bit2num[i]
                     if nm is not None:
                         nums.add(nm)
+                    elif i in pseudo:
+                        tid, q, run = pseudo[i]
+                        e = qbits.setdefault(tid, {"q": set(), "run": set(), "bad": False})
+                        if q is None:
+                            e["bad"] = True
+                        elif run:
+                            e["run"].add(q)
+                        else:
+                            e["q"].add(q)
                 bits >>= 1
                 i += 1
         except Exception as e:  # never fail: run everything
             log(f"{cid}: error {e!r}, selecting all")
             nums = set(ms)
-        if local_enabled and nums and info.get("local_ok"):
+        if local_enabled and nums and info.get("local_ok") and time.monotonic() - t_start < wall_budget:
             try:
-                nums = refine_local(info, nums, ms, idof)
+                nums = refine_local(info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id))
             except Exception as e:
                 log(f"{cid}: local run skipped ({e!r})")
         workers = pack([(ms[n], n) for n in nums])
