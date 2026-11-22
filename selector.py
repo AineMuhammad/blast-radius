@@ -961,6 +961,11 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
     tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3], tpc[n][5]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
     budgets = {idof[n]: max(10.0, 10 * ms[n] / 1000 + 5.0) for n in L if n not in tpc}  # stuck tests only
+    if est - LOCAL_OVERHEAD_MS > MAX_CHECK_MS:
+        # MAX-AGGRESSION BUILD: expensive checks are skipped (import checks still run)
+        if not import_mods:
+            return nums, None, 0
+        L, tpc_tasks, ids, budgets, sentinels = [], [], [], {}, {}
     wall = 20 + sum(budgets.values()) + sum(t[2] for t in tpc_tasks)
     import resource
 
@@ -1118,9 +1123,47 @@ def main():
                             nums = set(ms)
                     except Exception as e:  # noqa: BLE001
                         log(f"{cid}: local run skipped ({e!r})")
+        if nums and not info.get("force_all") and len(nums) < len(ms):
+            # MAX-AGGRESSION BUILD (not sound): estimated failure rates, fitted on labeled
+            # mutants, decide. Whole-suite selections (import or patch errors) are kept.
+            try:
+                d = _risk_dir(text)
+                if MAXR["dir"].get(d, MAXR["dir_prior"]) < MAXR["any_min"]:
+                    nums = set()
+                else:
+                    ranked = sorted(nums, key=lambda n: (-MAXR["test"].get(idof[n], MAXR["p0"]), ms[n], n))
+                    keep, used = [], 0
+                    for n in ranked:
+                        if keep and used + ms[n] > MAXR["cap_ms"]:
+                            continue
+                        keep.append(n)
+                        used += ms[n]
+                    nums = set(keep)
+            except Exception:  # noqa: BLE001
+                pass
         workers = pack([(ms[n], n) for n in nums])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+
+
+MAX_CHECK_MS = 500
+
+
+def _risk_dir(text):
+    for line in text.splitlines():
+        if line.startswith("+++ b/"):
+            f = line[6:].strip()
+            if f.startswith("sqlglot/") and "/" in f[8:]:
+                return f.split("/")[1]
+            return f
+    return "?"
+
+
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxrisk.json")) as _fh:
+        MAXR = json.load(_fh)
+except (OSError, ValueError):
+    MAXR = {"dir": {}, "dir_prior": 1.0, "any_min": 0.0, "test": {}, "p0": 1.0, "cap_ms": 10 ** 9}
 
 
 def fallback():
