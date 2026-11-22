@@ -749,7 +749,7 @@ def pack(items):
     """items: list of (ms, number). -> list of workers minimizing max + 2s*k (LPT per k)."""
     if not items:
         return []
-    items = sorted(items, key=lambda x: -x[0])
+    items = sorted(items, key=lambda x: (-x[0], x[1]))  # ties by test number: deterministic output
     total = sum(ms for ms, _ in items)
     best = None
     for k in range(1, MAX_WORKERS + 1):

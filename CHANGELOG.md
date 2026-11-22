@@ -169,3 +169,6 @@ Runtime CPU measured in-container on the samples.
 - Files whose code never runs in the traced suite (sqlglot/__main__.py) select nothing.
 - 150-set 540.6 + 50.8 s (v9.3 577.4 + 55.0); other sets unchanged. 0 misses; edge cases
   OK; byte-identical runs.
+- v9.4.1: packing breaks ties by test number. v9.4 chose identical tests on every commit
+  but could order equal-duration tests differently between runs (set insertion order follows
+  per-run string hashing). Now byte-identical on all four labeled sets.
