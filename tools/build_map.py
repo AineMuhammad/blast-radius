@@ -214,9 +214,29 @@ for f in FILES:
             if ln is not None:
                 bits |= cf.get(ln, 0)
         func_bits[(f, co.co_firstlineno, co.co_name)] = bits
-        if bits:
-            for n in names_of(co):
-                nameref[n] |= bits
+
+# name -> tests that executed a line where the name is referenced. A global or attribute
+# is read only when the instruction referencing it runs, i.e. when its line runs; using the
+# line instead of the whole function keeps this sound and much tighter.
+for f, tree in TREES.items():
+    cf = cov.get(f)
+    if not cf:
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            nameref[node.id] |= cf.get(node.lineno, 0)
+        elif isinstance(node, ast.Attribute):
+            nameref[node.attr] |= cf.get(node.end_lineno, 0)
+        elif isinstance(node, ast.alias):
+            nm = (node.asname or node.name).split(".")[0]
+            nameref[nm] |= cf.get(node.lineno, 0)
+            nameref[node.name.split(".")[-1]] |= cf.get(node.lineno, 0)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+            for l in range(node.lineno, node.end_lineno + 1):
+                nameref[node.value] |= cf.get(l, 0)
+        elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
+            for nm in node.names:
+                nameref[nm] |= cf.get(node.lineno, 0)
 
 
 BODY_REFS = defaultdict(set)
@@ -382,6 +402,18 @@ def made_at_import(C):
     if not import_types:
         return True  # old trace without the data: assume yes
     return any(issubclass(c, C) for c in IMPORT_CLASSES)
+
+
+_FILE_BITS = {}
+
+
+def file_bits(f):
+    if f not in _FILE_BITS:
+        b = 0
+        for v in cov.get(f, {}).values():
+            b |= v
+        _FILE_BITS[f] = b
+    return _FILE_BITS[f]
 
 
 def bits_lines(f, a, b):
@@ -589,6 +621,10 @@ def analyse(f):
                     else:
                         for nm in assigned_names(node):
                             bits |= nameref.get(nm, 0)
+                        if scope == "c" and any(nm.startswith("__") for nm in assigned_names(node)):
+                            # dunders are used implicitly (operators, protocols): no reference
+                            # line to follow, so every test that ran code in this file
+                            bits |= file_bits(f)
                         if scope == "c":
                             bits |= class_bits(f, qual)
                             if C is not None:

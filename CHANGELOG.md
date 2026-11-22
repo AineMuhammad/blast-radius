@@ -182,3 +182,11 @@ Runtime CPU measured in-container on the samples.
   it; tests reading a changed data file stay scheduled.
 - 80 random 257.1 + 41.6 s (v9.4.1 259.5 + 43.3); 150-set 507.5 + 60.0 s (540.6 + 53.4);
   samples and fresh unchanged. 0 misses; byte-identical runs; edge cases OK.
+
+## v9.6 — line-level name references
+- "Tests that may observe a name" now means tests that executed a line where the name is
+  referenced (attribute names at the attribute's last line, identifier-like string
+  constants, import aliases, global/nonlocal), instead of any line of a function that
+  mentions it. Class-level dunder assignments in untracked classes fall back to every test
+  that ran code in the file (dunders are used implicitly).
+- Fresh 249.7 + 17.0 s (v9.5 251.9 + 17.6); other sets within noise. 0 misses.
