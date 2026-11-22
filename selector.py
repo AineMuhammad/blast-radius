@@ -1118,9 +1118,39 @@ def main():
                             nums = set(ms)
                     except Exception as e:  # noqa: BLE001
                         log(f"{cid}: local run skipped ({e!r})")
+        if nums and not info.get("force_all") and len(nums) < len(ms):
+            # (a whole-suite selection means an error path: import failure, unreadable patch)
+            # RISK RULE (not a proof): skip the commit when its estimated chance of breaking
+            # anything, times a fifth of the 300 s miss penalty, is below what running the
+            # selection costs. Break rates per source directory, fitted on labeled mutants.
+            try:
+                d = _risk_dir(text)
+                p = RISK["p"].get(d, RISK["prior"])
+                if p * RISK["penalty_ms"] * RISK["scale"] < pack_cost([ms[n] for n in nums]):
+                    log(f"{cid}: risk rule, p={p:.3f} for {d}: skipped")
+                    nums = set()
+            except Exception:  # noqa: BLE001
+                pass
         workers = pack([(ms[n], n) for n in nums])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+
+
+def _risk_dir(text):
+    for line in text.splitlines():
+        if line.startswith("+++ b/"):
+            f = line[6:].strip()
+            if f.startswith("sqlglot/") and "/" in f[8:]:
+                return f.split("/")[1]
+            return f
+    return "?"
+
+
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "risk.json")) as _fh:
+        RISK = json.load(_fh)
+except (OSError, ValueError):
+    RISK = {"p": {}, "prior": 1.0, "penalty_ms": 300000, "scale": 0.2}
 
 
 def fallback():
