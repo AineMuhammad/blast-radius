@@ -82,6 +82,13 @@ if PROFILE and os.path.exists(PROFILE):
             if q.get("out") and "plan" in q["out"]:
                 # run phase only (PythonExecutor and result pickling): needs a full run
                 pseudo[f"@tpc:{tid}#{qi}R"] = {"lines": q["run_lines"], "classes": q["run_classes"]}
+                if q.get("rules") is not None:
+                    # glue (front + compile outside optimizer rules) and each rule separately:
+                    # a change reaching only rules can be checked by re-running those rules
+                    pseudo[f"@tpc:{tid}#{qi}G"] = {"lines": q["glue_lines"], "classes": q["glue_classes"]}
+                    for key, ls in q["rule_lines"].items():
+                        pseudo[f"@tpc:{tid}#{qi}K{key.split(':')[1]}"] = {
+                            "lines": ls, "classes": q["rule_classes"].get(key, [])}
         pseudo[f"@tpc:{tid}#setup"] = {"lines": v["setup_lines"], "classes": v.get("setup_classes", [])}
         pseudo[f"@tpc:{tid}#unmodelled"] = {"lines": {}, "classes": []}
 ids = sorted(tests) + sorted(pseudo)
@@ -814,6 +821,9 @@ if PROFILE and os.path.exists(PROFILE):
             index["heavy"][tid] = {
                 "cpu": [q["cpu"] for q in v["queries"]],
                 "cpu_compile": [q.get("cpu_compile") for q in v["queries"]],
+                # per query: resumable optimizer rules and their CPU (calib units)
+                "rules": [{k: r["cpu"] for k, r in (q.get("rules") or {}).items() if r["ok"]}
+                          if q.get("rules") is not None else None for q in v["queries"]],
                 # items that always run when the test is checked (optimizer "rest")
                 "always": [i for i, it in enumerate(v.get("items", [])) if it == "rest"],
                 "tables": [q["tables"] for q in v["queries"]],

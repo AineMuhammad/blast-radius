@@ -153,6 +153,54 @@ def plan_digest(plan):
     return hashlib.sha256(repr(body).encode()).hexdigest()
 
 
+def expr_digest(e):
+    """Digest of an expression: class, args, type, comments and meta, recursively."""
+    import enum
+
+    import sqlglot.expressions as exp
+
+    Expr = getattr(exp, "Expr", None) or exp.Expression
+
+    def c(v):
+        if isinstance(v, Expr):
+            t = v.__dict__.get("_type")
+            # None and [] arguments are absent arguments (args.get() returns None either way,
+            # and sqlglot's own pickling drops them), so they are left out
+            args = tuple((k, c(x)) for k, x in sorted(v.args.items()) if x is not None and x != [])
+            return ("e", type(v).__qualname__, args,
+                    c(t) if t is not None else None, tuple(v.comments or ()),
+                    c(v.__dict__.get("_meta")) if v.__dict__.get("_meta") else None)
+        if isinstance(v, dict):
+            return ("d", tuple(sorted(((repr(c(k)), c(x)) for k, x in v.items()), key=lambda kv: kv[0])))
+        if isinstance(v, (list, tuple)):
+            return ("l", tuple(c(x) for x in v))
+        if isinstance(v, (set, frozenset)):
+            return ("s", tuple(sorted(repr(c(x)) for x in v)))
+        if isinstance(v, enum.Enum):
+            return ("n", type(v).__qualname__, v.name)
+        if isinstance(v, type):
+            return ("t", v.__module__, v.__qualname__)
+        if isinstance(v, (str, int, float, bool, type(None))):
+            return ("v", type(v).__name__, repr(v))
+        raise TypeError(f"unexpected value in expression: {type(v).__qualname__}")
+
+    return hashlib.sha256(repr(c(e)).encode()).hexdigest()
+
+
+def rule_kwargs(rule, ds):
+    """The keyword arguments optimize() hands this rule when execute() calls it."""
+    import inspect
+
+    from sqlglot.schema import ensure_schema
+
+    possible = {
+        "db": None, "catalog": None, "schema": ensure_schema(_schema(ds)), "dialect": None,
+        "sql": None, "isolate_tables": True, "quote_identifiers": False,
+        "leave_tables_isolated": True,
+    }
+    return {p: possible[p] for p in inspect.getfullargspec(rule).args if p in possible}
+
+
 def run_one(ds, mode, meta, sql, optimized, tables, compile_only=False, phase=None):
     build_marks = phase is not None
     """Mirror what the test does for one query. Returns a comparable record.
@@ -275,7 +323,23 @@ def load_tables(data_dir, ds, names):
 MAX_FULL_FALLBACKS = 3  # plan changed -> full run of that query, at most this many per check
 
 
-def check(data_dir, test_id, indices, budget, compile_only=()):
+def resume_rules(data_dir, ds, i, rules, expected):
+    """Re-run the given optimizer rules from their saved inputs with the patched code.
+    True if every output matches the unpatched one (then optimize() returns the same)."""
+    from sqlglot.optimizer.optimizer import RULES
+
+    with open(os.path.join(data_dir, "snap", f"{i}.pkl"), "rb") as f:
+        inputs = pickle.load(f)
+    for k in sorted(rules):
+        if k not in inputs or str(k) not in expected:
+            return False
+        r = RULES[k]
+        if expr_digest(r(pickle.loads(inputs[k]), **rule_kwargs(r, ds))) != expected[str(k)]:
+            return False
+    return True
+
+
+def check(data_dir, test_id, indices, budget, compile_only=(), resume=None):
     """True if every listed query reproduces its stored outputs.
 
     Queries in compile_only are checked up to the executor's plan."""
@@ -293,10 +357,17 @@ def check(data_dir, test_id, indices, budget, compile_only=()):
         names.update(prof["queries"][i].get("tables", []))
     tables = load_tables(data_dir, ds, sorted(names)) if names else {}
     compile_only = set(compile_only)
+    resume = resume or {}
     fallbacks = 0
     for i in indices:
         meta, sql, optimized = queries[i]
         exp_rec = prof["queries"][i]["out"]
+        if i in compile_only and i in resume and prof["queries"][i].get("rules_out"):
+            try:
+                if resume_rules(data_dir, ds, i, resume[i], prof["queries"][i]["rules_out"]):
+                    continue  # the changed rules give the same outputs: same plan
+            except Exception:  # noqa: BLE001  (fall through to the full compile check)
+                pass
         if i in compile_only and "plan" in (exp_rec or {}):
             rec = run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
             if rec == {"duck": exp_rec["duck"], "plan": exp_rec["plan"], "tables": exp_rec["tables"]}:
@@ -466,6 +537,44 @@ def _trace_task(args):
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
     M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
+
+    # optimizer rules: each one's coverage goes to its own bucket "rule:<k>"
+    from sqlglot.optimizer.optimizer import RULES
+
+    rule_codes = {r.__code__: k for k, r in enumerate(RULES)}
+    stack = []
+    names_of_bucket = {id(b): n for n, b in buckets.items()}
+
+    def rule_start(code, off):
+        k = rule_codes.get(code)
+        if k is not None and cur[0] is not None:
+            stack.append(cur[0])
+            phase(f"rule:{k}")
+        return None
+
+    def rule_return(code, off, val):
+        if rule_codes.get(code) is not None and stack:
+            b = stack.pop()
+            cur[0] = b
+            global _types
+            _types = b[1]
+            _ABUCKET[0] = b[0]
+            M.restart_events()
+        return None
+
+    _orig_phase = phase
+
+    def phase(name):  # noqa: F811  (buckets are created on demand for rules)
+        if name and name not in buckets:
+            buckets[name] = ({}, set())
+        _orig_phase(name)
+
+    if M.get_tool(3) is None:
+        M.use_tool_id(3, "tpc-rules")
+    M.register_callback(3, M.events.PY_START, rule_start)
+    M.register_callback(3, M.events.PY_RETURN, rule_return)
+    for code in rule_codes:
+        M.set_local_events(3, code, M.events.PY_START | M.events.PY_RETURN)
     t0 = time.process_time()
     M.set_events(5, M.events.LINE | M.events.PY_START)
     try:
@@ -474,6 +583,8 @@ def _trace_task(args):
     except Exception as e:  # noqa: BLE001
         rec, err = None, repr(e)
     M.set_events(5, 0)
+    for code in rule_codes:
+        M.set_local_events(3, code, 0)
     phase(None)
     lines = {}
     types = set()
@@ -506,10 +617,20 @@ def _trace_task(args):
     unit = calib()
     cpu, cpu_compile = cpu / unit, (cpu_compile / unit if cpu_compile is not None else None)
     used = []
+    snap = None
     if mode == "execute" and meta.get("execute"):
         from sqlglot import find_tables, parse_one
 
         used = sorted({t.name for t in find_tables(parse_one(sql))})
+        if rec is not None and "plan" in rec:
+            snap = _rule_snapshots(ds, mode, meta, sql, optimized, tables, data_dir, i, unit)
+    rule_lines = {k: {f: sorted(v) for f, v in b[0].items()} for k, b in buckets.items() if k.startswith("rule:")}
+    rule_classes = {k: _classes(b[1]) for k, b in buckets.items() if k.startswith("rule:")}
+    glue = {}
+    for k in ("front", "compile"):
+        for f, v in buckets[k][0].items():
+            glue.setdefault(f, set()).update(v)
+    glue_classes = _classes(buckets["front"][1] | buckets["compile"][1])
     return test_id, i, {
         "out": rec,
         "err": err,
@@ -518,11 +639,76 @@ def _trace_task(args):
         "cpu_compile": round(cpu_compile, 4) if cpu_compile is not None else None,
         "run_lines": {f: sorted(v) for f, v in run_lines.items()},
         "run_classes": _classes(run_types),
+        "glue_lines": {f: sorted(v) for f, v in glue.items()},
+        "glue_classes": glue_classes,
+        "rule_lines": rule_lines,
+        "rule_classes": rule_classes,
+        "rules": snap,
         "traced": round(traced, 4),
         "tables": used,
         "classes": _classes(types),
         "lines": {f: sorted(v) for f, v in lines.items()},
     }
+
+
+def _rule_snapshots(ds, mode, meta, sql, optimized, tables, data_dir, i, unit):
+    """Untraced compile of one query that records every optimizer rule's input (pickled) and
+    output digest, then re-runs each rule from its saved input: a rule is resumable only if
+    that reproduces its output exactly. Inputs go to <data_dir>/snap/<i>.pkl."""
+    from sys import monitoring as M
+
+    from sqlglot.optimizer.optimizer import RULES
+
+    rule_codes = {r.__code__: k for k, r in enumerate(RULES)}
+    inputs, outputs, cpu = {}, {}, {}
+    depth = {}
+    t_in = {}
+
+    def start(code, off):
+        k = rule_codes.get(code)
+        if k is not None:
+            depth[k] = depth.get(k, 0) + 1
+            if depth[k] == 1 and k not in inputs:
+                frame = sys._getframe(1)
+                inputs[k] = pickle.dumps(frame.f_locals[code.co_varnames[0]])
+                t_in[k] = time.process_time()
+        return None
+
+    def ret(code, off, val):
+        k = rule_codes.get(code)
+        if k is not None:
+            depth[k] -= 1
+            if depth[k] == 0 and k not in outputs:
+                cpu[k] = time.process_time() - t_in[k]
+                outputs[k] = expr_digest(val)
+        return None
+
+    if M.get_tool(2) is None:
+        M.use_tool_id(2, "tpc-snap")
+    M.register_callback(2, M.events.PY_START, start)
+    M.register_callback(2, M.events.PY_RETURN, ret)
+    for code in rule_codes:
+        M.set_local_events(2, code, M.events.PY_START | M.events.PY_RETURN)
+    try:
+        run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
+    finally:
+        for code in rule_codes:
+            M.set_local_events(2, code, 0)
+    ok = {}
+    for k, r in enumerate(RULES):
+        if k not in inputs or k not in outputs:
+            ok[k] = False
+            continue
+        try:
+            out = r(pickle.loads(inputs[k]), **rule_kwargs(r, ds))
+            ok[k] = expr_digest(out) == outputs[k]
+        except Exception:  # noqa: BLE001
+            ok[k] = False
+    os.makedirs(os.path.join(data_dir, "snap"), exist_ok=True)
+    with open(os.path.join(data_dir, "snap", f"{i}.pkl"), "wb") as f:
+        pickle.dump({k: inputs[k] for k in inputs if ok.get(k)}, f, protocol=4)
+    return {str(k): {"ok": ok[k], "out": outputs.get(k), "cpu": round(cpu.get(k, 0) / unit, 4)}
+            for k in range(len(RULES))}
 
 
 def _setup_task(args):
@@ -758,7 +944,11 @@ def profile(root, out_dir):
             if v.get("mode") == "optimizer":
                 slim[tid] = {"mode": "optimizer", "items": v["items"], "expect": v["expect"]}
             else:
-                slim[tid] = {"queries": [{"out": q["out"], "tables": q["tables"]} for q in v["queries"]]}
+                slim[tid] = {"queries": [
+                    {"out": q["out"], "tables": q["tables"],
+                     **({"rules_out": {k: r["out"] for k, r in q["rules"].items() if r["ok"]}}
+                        if q.get("rules") else {})}
+                    for q in v["queries"]]}
         with open(os.path.join(out_dir, "expect.json"), "w") as f:
             json.dump(slim, f, separators=(",", ":"))
 

@@ -616,13 +616,13 @@ def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=(), import_mods=()):
     devnull = open(os.devnull, "w")
     sys.stdout = devnull
     sys.stderr = devnull
-    for tid, indices, budget, compile_only in tpc_tasks:
+    for tid, indices, budget, compile_only, resume in tpc_tasks:
         try:
             sys.path.insert(0, HERE)
             import tpc
 
             signal.setitimer(signal.ITIMER_REAL, budget)
-            ok = tpc.check(TPC_DIR, tid, indices, budget, compile_only)
+            ok = tpc.check(TPC_DIR, tid, indices, budget, compile_only, resume)
         except BaseException:
             ok = False
         finally:
@@ -778,7 +778,7 @@ def pack(items):
     return [w for w in best[1] if w]
 
 
-def tpc_plans(mp, qbits, nums, by_id, ms):
+def tpc_plans(mp, qbits, nums, by_id, ms, allow_resume=False):
     """{test number: (test id, query indices, est ms, compile-only indices)}.
 
     The estimate is the share of the test's work the selected items represent (a ratio of
@@ -807,11 +807,23 @@ def tpc_plans(mp, qbits, nums, by_id, ms):
         ds = "tpch" if "tpch" in tid else "tpcds"
         mb = sum(mp.index.get("table_bytes", {}).get(f"{ds}/{t}", 0) for t in names) / 1e6
         whole = sum(c for c in h["cpu"] if c) or 1.0
-        share = (sum(h["cpu"][i] for i in full) + sum(cc[i] for i in compile_only)) / whole
+        # compile-only queries whose change reaches only optimizer rules (no glue) can be
+        # checked by re-running those rules from saved inputs
+        resume = {}
+        hr = h.get("rules") or [None] * len(h["cpu"])
+        if allow_resume:
+            for i in compile_only:
+                ks = sel.get("rules", {}).get(i)
+                ok = hr[i] or {}
+                if ks and i not in sel.get("glue", set()) and all(str(k) in ok for k in ks):
+                    resume[i] = sorted(ks)
+        share = (sum(h["cpu"][i] for i in full)
+                 + sum(cc[i] for i in compile_only if i not in resume)
+                 + sum(sum(hr[i][str(k)] for k in resume[i]) for i in resume)) / whole
         est = TPC_FACTOR * ms[n] * share + TPC_LOAD_MS_PER_MB * mb + 50
         # worst case: every compile-only query also runs fully (its plan changed)
         worst = TPC_FACTOR * ms[n] * sum(h["cpu"][i] for i in q) / whole + TPC_LOAD_MS_PER_MB * mb + 50
-        out[n] = (tid, q, est, compile_only, worst)
+        out[n] = (tid, q, est, compile_only, worst, resume)
     return out
 
 
@@ -931,7 +943,7 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
     est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
     # outer safety kill only: sized for the worst case with a wide margin, so it fires only
     # for a stuck check (and then every test is kept)
-    tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3]) for n in L if n in tpc]
+    tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3], tpc[n][5]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
     budgets = {idof[n]: max(10.0, 10 * ms[n] / 1000 + 5.0) for n in L if n not in tpc}  # stuck tests only
     wall = 20 + sum(budgets.values()) + sum(t[2] for t in tpc_tasks)
@@ -980,6 +992,10 @@ def main():
                 pseudo[i] = (tid, int(q), False)
             elif q.endswith("R") and q[:-1].isdigit():
                 pseudo[i] = (tid, int(q[:-1]), True)  # reaches the run phase
+            elif q.endswith("G") and q[:-1].isdigit():
+                pseudo[i] = (tid, int(q[:-1]), "G")  # glue: front or compile outside rules
+            elif "K" in q and q.split("K")[0].isdigit() and q.split("K")[1].isdigit():
+                pseudo[i] = (tid, int(q.split("K")[0]), ("K", int(q.split("K")[1])))
             else:
                 pseudo[i] = (tid, None, False)
     known = set(n for n in bit2num if n is not None)
@@ -1001,9 +1017,16 @@ def main():
                     nums.add(nm)
                 elif i in pseudo:
                     tid, q, run = pseudo[i]
-                    e = qbits.setdefault(tid, {"q": set(), "run": set(), "bad": False})
+                    e = qbits.setdefault(tid, {"q": set(), "run": set(), "bad": False,
+                                               "glue": set(), "rules": {}})
                     if q is None:
                         e["bad"] = True
+                    elif run == "G":
+                        e["glue"].add(q)
+                        e["q"].add(q)
+                    elif isinstance(run, tuple):
+                        e["rules"].setdefault(q, set()).add(run[1])
+                        e["q"].add(q)
                     elif run:
                         e["run"].add(q)
                     else:
@@ -1067,7 +1090,11 @@ def main():
                 if in_budget or info.get("import_check"):
                     try:
                         nums, import_error, spent = refine_local(
-                            info, nums, ms, idof, tpc_plans(mp, qbits, nums, by_id, ms), patched,
+                            info, nums, ms, idof,
+                            tpc_plans(mp, qbits, nums, by_id, ms,
+                                      allow_resume=not info.get("import_check") and not any(
+                                          p == "sqlglot/optimizer/optimizer.py" for p in info.get("files", {}))),
+                            patched,
                             allow_tests=bool(nums) and info.get("local_ok") and in_budget,
                             num_bit=num_bit, total_bits=total_bits)
                         est_used += spent

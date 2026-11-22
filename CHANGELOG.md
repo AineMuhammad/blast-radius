@@ -190,3 +190,20 @@ Runtime CPU measured in-container on the samples.
   mentions it. Class-level dunder assignments in untracked classes fall back to every test
   that ran code in the file (dunders are used implicitly).
 - Fresh 249.7 + 17.0 s (v9.5 251.9 + 17.6); other sets within noise. 0 misses.
+- Board (816c042, v9.6): **155.7 s** (132.656 s simulated + 23.0 s CPU), 0 misses.
+- Board probes: empty probe 29 misses (29 of 40 commits break something); probe B saved
+  21.45 s with 0 misses (the remaining A/B waste is an executor edit); long-test probe =
+  TPC-DS probe (test_max_nodes / test_generator_memory never scheduled on the board).
+
+## v9.8 — per-rule resume for TPC compile checks
+- At build, each TPC-DS query's compile run records every optimizer rule's input (pickled)
+  and output fingerprint, and the coverage of each rule separately from the "glue" (parsing,
+  DuckDB SQL, optimize()'s loop, Plan). Every (query, rule) pair is re-run from its saved
+  input and must reproduce its output (798 of 798 do).
+- At run time a compile-only query whose change reaches only optimizer rules (no glue, no
+  import-time change, not optimizer.py itself) re-runs just those rules from their saved
+  inputs; equal outputs mean optimize() returns the same expression. Otherwise the full
+  compile check runs as before.
+- Rule fingerprints ignore None/[] arguments (absent arguments; sqlglot's pickling drops them).
+- Same selections as v9.6 on all labeled sets; 150-set CPU 30.3 s (v9.6 40.0 s).
+  0 misses; byte-identical runs; edge cases OK. Snapshots: 34 MB in the image.
