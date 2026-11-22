@@ -32,7 +32,10 @@ TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", "execute"),
     "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", "optimized"),
     "tests/test_generator.py::TestGenerator::test_generator_memory": ("dialects", "genmem"),
+    # fixture-driven: one item per (fixture entry, dialect), i.e. per subTest
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": ("annotate", "annotate"),
 }
+ANNOTATE_FIXTURE = "optimizer/annotate_functions.sql"
 FIXTURE = {"tpch": "optimizer/tpc-h/tpc-h.sql", "tpcds": "optimizer/tpc-ds/tpc-ds.sql"}
 DATA_DIR = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 
@@ -62,7 +65,29 @@ def _schema(ds):
     return helpers.TPCH_SCHEMA if ds == "tpch" else helpers.TPCDS_SCHEMA
 
 
+def _annotate_schema():
+    """The test_schema literal inside TestOptimizer.test_annotate_funcs, read from its source."""
+    import ast as _ast
+    import tests.test_optimizer as m
+
+    tree = _ast.parse(open(m.__file__).read())
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == "test_annotate_funcs":
+            for st in node.body:
+                if isinstance(st, _ast.Assign) and getattr(st.targets[0], "id", None) == "test_schema":
+                    return _ast.literal_eval(st.value)
+    raise RuntimeError("test_schema not found in test_annotate_funcs")
+
+
 def _queries(ds):
+    if ds == "annotate":
+        from tests.helpers import load_sql_fixture_pairs
+
+        out = []
+        for i, (meta, sql, expected) in enumerate(load_sql_fixture_pairs(ANNOTATE_FIXTURE), start=1):
+            for dialect in (meta.get("dialect") or "").split(", "):
+                out.append(({}, (f"SELECT {sql} FROM tbl", dialect, expected), None))
+        return out
     if ds == "dialects":
         from sqlglot.dialects import Dialects
 
@@ -95,6 +120,9 @@ def _genmem(name):
     if not after - before < 1024:
         raise AssertionError(f"{name}: {after - before} bytes")
     return {"ok": True}
+
+
+_ANNOTATE_SCHEMA = []
 
 
 class _Stop(Exception):
@@ -215,6 +243,20 @@ def run_one(ds, mode, meta, sql, optimized, tables, compile_only=False, phase=No
     phase("front")
     if mode == "genmem":
         return _genmem(sql)
+    if mode == "annotate":
+        # one subTest of test_annotate_funcs, through the test module's own helpers
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import opt_model
+
+        mod = opt_model.load_module()
+        from sqlglot import exp
+
+        q, dialect, expected = sql
+        schema = _ANNOTATE_SCHEMA[0] if _ANNOTATE_SCHEMA else _ANNOTATE_SCHEMA.append(_annotate_schema()) or _ANNOTATE_SCHEMA[0]
+        result = mod.parse_and_optimize(mod.annotate_functions, q, dialect, schema=schema, dialect=dialect)
+        if result.type.sql(dialect) != exp.DataType.build(expected, dialect=dialect).sql(dialect):
+            raise AssertionError("annotate_funcs entry differs")
+        return {"ok": True}
     if mode == "optimized":
         # test_optimized_tpch: DuckDB runs sqlglot's DuckDB SQL for both statements
         return {"a": transpile(sql, write="duckdb")[0], "b": transpile(optimized, write="duckdb")[0]}
@@ -711,9 +753,71 @@ def _rule_snapshots(ds, mode, meta, sql, optimized, tables, data_dir, i, unit):
             for k in range(len(RULES))}
 
 
+def _annotate_chunk_task(args):
+    """Profile a chunk of test_annotate_funcs items in one process: run them all untraced
+    first (imports, one-off set-up), then trace each item into its own bucket. Code that
+    ran only during the warm-up belongs to no item and is flagged as unmodelled."""
+    root, data_dir, tid, start, end = args
+    from sys import monitoring as M
+
+    ds, mode = TESTS[tid]
+    items = _queries(ds)
+    for i in range(start, end):  # warm-up
+        meta, sql, optimized = items[i]
+        try:
+            run_one(ds, mode, meta, sql, optimized, {})
+        except Exception:  # noqa: BLE001
+            pass
+    global _types
+    _hook_classes()
+    _install_watchers()
+    prefix = os.path.join(root, "sqlglot") + "/"
+    cur = [None]
+
+    def cb(code, line):
+        b = cur[0]
+        if b is not None and code.co_filename.startswith(prefix) and code.co_flags & 1:
+            b[0].setdefault(code.co_filename[len(root) + 1:], set()).add(line)
+        return M.DISABLE
+
+    if M.get_tool(5) is None:
+        M.use_tool_id(5, "tpc")
+    M.register_callback(5, M.events.LINE, cb)
+    M.register_callback(5, M.events.PY_START, lambda code, off: cb(code, code.co_firstlineno))
+    out = []
+    unit = calib()
+    for i in range(start, end):
+        meta, sql, optimized = items[i]
+        bucket = ({}, set())
+        cur[0] = bucket
+        _types = bucket[1]
+        _ABUCKET[0] = bucket[0]
+        M.restart_events()
+        M.set_events(5, M.events.LINE | M.events.PY_START)
+        err = None
+        try:
+            rec = run_one(ds, mode, meta, sql, optimized, {})
+        except Exception as e:  # noqa: BLE001
+            rec, err = None, repr(e)
+        M.set_events(5, 0)
+        cur[0] = None
+        _types = None
+        _ABUCKET[0] = None
+        t0 = time.process_time()
+        if rec is not None:
+            run_one(ds, mode, meta, sql, optimized, {})
+        cpu = (time.process_time() - t0) / unit
+        out.append((i, {"out": rec, "err": err, "unit": round(unit, 6), "cpu": round(cpu, 4),
+                        "cpu_compile": None, "tables": [], "classes": _classes(bucket[1]),
+                        "lines": {f: sorted(v) for f, v in bucket[0].items()}}))
+    return tid, out
+
+
 def _setup_task(args):
     """Coverage of the shared part: building Table objects from rows."""
     root, data_dir, ds = args
+    if ds == "annotate":
+        return ds, ({}, [])  # shared work is covered by the warm-up / unmodelled flags
     from sys import monitoring as M
 
     prefix = os.path.join(root, "sqlglot") + "/"
@@ -902,15 +1006,24 @@ def profile(root, out_dir):
             with open(os.path.join(out_dir, ds, table + ".pkl"), "wb") as f:
                 pickle.dump(_read_csv(root, ds, table), f, protocol=4)
     tasks = []
-    for tid, (ds, _) in TESTS.items():
-        for i in range(len(_queries(ds))):
+    chunks = []
+    for tid, (ds, mode) in TESTS.items():
+        n_items = len(_queries(ds))
+        if mode == "annotate":
+            step = (n_items + 3) // 4
+            chunks += [(root, out_dir, tid, a, min(a + step, n_items)) for a in range(0, n_items, step)]
+            continue
+        for i in range(n_items):
             tasks.append((root, out_dir, tid, i))
     ctx = mp.get_context("spawn")
     res = {tid: {"queries": [None] * len(_queries(ds))} for tid, (ds, _) in TESTS.items()}
     with ctx.Pool(4, initializer=_init, initargs=(root,), maxtasksperchild=1) as pool:
         for tid, i, rec in pool.imap_unordered(_trace_task, tasks):
             res[tid]["queries"][i] = rec
-        setup = dict(pool.map(_setup_task, [(root, out_dir, ds) for ds in ("tpch", "tpcds", "dialects")]))
+        for tid, recs in pool.imap_unordered(_annotate_chunk_task, chunks):
+            for i, rec in recs:
+                res[tid]["queries"][i] = rec
+        setup = dict(pool.map(_setup_task, [(root, out_dir, ds) for ds in ("tpch", "tpcds", "dialects", "annotate")]))
         opt_setup = pool.apply(_opt_setup_task, (root,))
     # optimizer per-entry models: off by default. On fresh out-of-sample commits they
     # traded simulated seconds for the same CPU and cost two minutes of build time.
@@ -921,7 +1034,8 @@ def profile(root, out_dir):
         with ctx.Pool(4, initializer=_init, initargs=(root,), maxtasksperchild=12) as pool:
             opt_res = list(pool.imap_unordered(_opt_task, [(root, m) for m in opt_methods(root)]))
     for tid, (ds, _) in TESTS.items():
-        res[tid]["setup_lines"], res[tid]["setup_classes"] = setup[ds]
+        if tid in res:
+            res[tid]["setup_lines"], res[tid]["setup_classes"] = setup[ds]
     skipped = []
     for tid, rec, why in opt_res:
         if rec is None:
@@ -933,7 +1047,12 @@ def profile(root, out_dir):
           file=sys.stderr)
     for m, why in skipped[:12]:
         print(f"  skipped {m}: {why[:100]}", file=sys.stderr)
-    bad = [(tid, q["err"]) for tid in res for q in res[tid]["queries"] if q.get("err")]
+    for tid, (ds, mode) in TESTS.items():
+        if mode == "annotate" and tid in res and any(q is None or q.get("err") for q in res[tid]["queries"]):
+            print(f"{tid}: some items fail under the model; not modelled", file=sys.stderr)
+            del res[tid]
+    bad = [(tid, q["err"]) for tid in res if not tid.startswith("@") and isinstance(res[tid], dict)
+           for q in res[tid].get("queries", []) if q and q.get("err")]
     if bad:
         raise SystemExit(f"TPC profile: unpatched queries failed: {bad[:3]}")
     def write_slim():

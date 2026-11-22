@@ -215,3 +215,12 @@ Runtime CPU measured in-container on the samples.
   fingerprinted by their sorted elements. Identity hits on the 308 labeled commits: 29.
 - 150-set 470.9 + 30.4 s (v9.8 507.7 + 31.2), e.g. `return None` -> `return` in parser.py
   now selects nothing. Other sets unchanged. 0 misses; byte-identical runs; edge cases OK.
+
+## v9.11 — item model for test_annotate_funcs
+- test_annotate_funcs (2.0 s, scheduled by most dialect-flag and arg_types edits) is now
+  modelled per subTest: 2,435 items, one per (fixture entry, dialect), each profiled with
+  its own coverage after an untraced warm-up. A change reaching only some items re-runs
+  just those items locally through the test module's own helpers and schema; any failure,
+  or code that only the warm-up ran, keeps the test scheduled.
+- Totals: samples 109.6 (109.4), fresh 259.8 (261.8), ev80 291.0 (299.5), 150-set 511.1
+  (521.0). 0 misses; byte-identical runs; edge cases OK; clean build 4.6 min on 4 cores.
