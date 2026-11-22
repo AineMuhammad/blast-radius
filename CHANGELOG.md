@@ -260,3 +260,16 @@ Runtime CPU measured in-container on the samples.
   the reading file. v9.13's version followed whole files and cost 4.6 s on the board.
 - Totals: renames 0 misses (v9.11: 1), samples 105.4, fresh 241.6, ev80 193.5, 150-set
   451.9 (v9.11 457.7). 0 misses; byte-identical runs; edge cases OK; build_map 46 s.
+
+## v9.15 — reuse optimizer output in executor checks
+- At build time each TPC-DS query's optimize() output is saved with a digest of its
+  arguments (expression, schema mapping, dialect class and settings, keyword arguments),
+  and kept only if a full run that reuses it gives exactly the record of a normal run
+  (plan included): 57 of 57 executed queries.
+- A full check of a query whose change reaches no compile-phase code (no glue, no optimizer
+  rule; no import-time change; optimizer.py untouched) reuses that output; the stand-in
+  calls the real optimize() for any other arguments. The executor itself still runs with the
+  patched code.
+- Plan digests ignore None/[] arguments, as expression digests do.
+- Selections identical to v9.14 on every labeled set; executor check of m01037 12.6 s -> 11.0 s
+  CPU. 0 misses; byte-identical runs; edge cases OK.

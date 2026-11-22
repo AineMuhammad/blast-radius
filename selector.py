@@ -622,13 +622,13 @@ def _child_run(patched, test_ids, budgets, wfd, tpc_tasks=(), import_mods=()):
     devnull = open(os.devnull, "w")
     sys.stdout = devnull
     sys.stderr = devnull
-    for tid, indices, budget, compile_only, resume in tpc_tasks:
+    for tid, indices, budget, compile_only, resume, reuse in tpc_tasks:
         try:
             sys.path.insert(0, HERE)
             import tpc
 
             signal.setitimer(signal.ITIMER_REAL, budget)
-            ok = tpc.check(TPC_DIR, tid, indices, budget, compile_only, resume)
+            ok = tpc.check(TPC_DIR, tid, indices, budget, compile_only, resume, reuse)
         except BaseException:
             ok = False
         finally:
@@ -829,7 +829,11 @@ def tpc_plans(mp, qbits, nums, by_id, ms, allow_resume=False):
         est = TPC_FACTOR * ms[n] * share + TPC_LOAD_MS_PER_MB * mb + 50
         # worst case: every compile-only query also runs fully (its plan changed)
         worst = TPC_FACTOR * ms[n] * sum(h["cpu"][i] for i in q) / whole + TPC_LOAD_MS_PER_MB * mb + 50
-        out[n] = (tid, q, est, compile_only, worst, resume)
+        # full queries whose change reaches no compile-phase code (no glue, no rule): the
+        # check reuses their saved optimizer output (same arguments, same code)
+        reuse = [i for i in full if allow_resume and hr[i] is not None
+                 and i not in sel.get("glue", set()) and i not in sel.get("rules", {})]
+        out[n] = (tid, q, est, compile_only, worst, resume, reuse)
     return out
 
 
@@ -958,7 +962,7 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
     est = LOCAL_OVERHEAD_MS + sum(tpc[n][2] if n in tpc else LOCAL_FACTOR * ms[n] for n in L)
     # outer safety kill only: sized for the worst case with a wide margin, so it fires only
     # for a stuck check (and then every test is kept)
-    tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3], tpc[n][5]) for n in L if n in tpc]
+    tpc_tasks = [(tpc[n][0], tpc[n][1], 60 + 5 * tpc[n][4] / 1000, tpc[n][3], tpc[n][5], tpc[n][6]) for n in L if n in tpc]
     ids = [idof[n] for n in L if n not in tpc]
     budgets = {idof[n]: max(10.0, 10 * ms[n] / 1000 + 5.0) for n in L if n not in tpc}  # stuck tests only
     wall = 20 + sum(budgets.values()) + sum(t[2] for t in tpc_tasks)

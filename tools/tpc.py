@@ -148,7 +148,9 @@ def plan_digest(plan):
         if isinstance(v, Step):
             return ("step", h(v))
         if isinstance(v, Expr):
-            args = tuple((k, c(x)) for k, x in sorted(v.args.items()))
+            # None and [] arguments are absent (args.get() gives None either way; pickling
+            # drops them), as in expr_digest
+            args = tuple((k, c(x)) for k, x in sorted(v.args.items()) if x is not None and x != [])
             t = v.__dict__.get("_type")
             return ("e", type(v).__qualname__, args, c(t) if t is not None else None, tuple(v.comments or ()))
         if isinstance(v, dict):
@@ -381,7 +383,7 @@ def resume_rules(data_dir, ds, i, rules, expected):
     return True
 
 
-def check(data_dir, test_id, indices, budget, compile_only=(), resume=None):
+def check(data_dir, test_id, indices, budget, compile_only=(), resume=None, reuse=()):
     """True if every listed query reproduces its stored outputs.
 
     Queries in compile_only are checked up to the executor's plan."""
@@ -425,7 +427,24 @@ def check(data_dir, test_id, indices, budget, compile_only=(), resume=None):
             if {k: v for k, v in rec.items() if k != "plan"} != {k: v for k, v in exp_rec.items() if k != "plan"}:
                 return False
         else:
-            rec = run_one(ds, mode, meta, sql, optimized, tables)
+            rec = None
+            opt_p = os.path.join(data_dir, "snap", f"{i}.opt.pkl")
+            if i in reuse and os.path.exists(opt_p):
+                # the change reaches no code run before the executor (no glue, no rule):
+                # optimize() gets the same arguments and runs the same code, so its saved
+                # output is used; the stand-in calls the real optimize on any other input
+                import sqlglot.executor as ex
+
+                with open(opt_p, "rb") as f:
+                    saved = pickle.load(f)
+                real = ex.optimize
+                ex.optimize = _Reuse(real, tuple(saved["key"]), saved["blob"])
+                try:
+                    rec = run_one(ds, mode, meta, sql, optimized, tables)
+                finally:
+                    ex.optimize = real
+            if rec is None:
+                rec = run_one(ds, mode, meta, sql, optimized, tables)
             if {k: v for k, v in rec.items() if k != "plan"} != {k: v for k, v in exp_rec.items() if k != "plan"}:
                 return False
         # no deadline here: the outcome must depend only on outputs. The selector's outer
@@ -666,6 +685,7 @@ def _trace_task(args):
         used = sorted({t.name for t in find_tables(parse_one(sql))})
         if rec is not None and "plan" in rec:
             snap = _rule_snapshots(ds, mode, meta, sql, optimized, tables, data_dir, i, unit)
+            _save_optimized(ds, mode, meta, sql, optimized, tables, data_dir, i, rec)
     rule_lines = {k: {f: sorted(v) for f, v in b[0].items()} for k, b in buckets.items() if k.startswith("rule:")}
     rule_classes = {k: _classes(b[1]) for k, b in buckets.items() if k.startswith("rule:")}
     glue = {}
@@ -691,6 +711,122 @@ def _trace_task(args):
         "classes": _classes(types),
         "lines": {f: sorted(v) for f, v in lines.items()},
     }
+
+
+def _opt_key(args, kwargs):
+    """Digest of optimize()'s arguments as execute() passes them: (expression, schema)."""
+    if len(args) != 2 or any(not isinstance(v, (str, bool, type(None))) for v in kwargs.values()):
+        return None
+    expr, schema = args
+    mapping = getattr(schema, "mapping", None)
+    if mapping is None:
+        return None
+    return (expr_digest(expr), type(schema).__qualname__,
+            json.dumps(mapping, sort_keys=True, default=repr), repr(sorted(kwargs.items())),
+            _dialect_key(getattr(schema, "dialect", None)), repr(getattr(schema, "normalize", None)))
+
+
+def _dialect_key(d):
+    # the dialect object's default repr holds its address: use its class and settings
+    if d is None:
+        return None
+    return (type(d).__module__, type(d).__qualname__, repr(getattr(d, "normalization_strategy", None)))
+
+
+def _exact_dumps(obj):
+    """Pickle an expression tree with its full object state (types, meta, comments), not
+    sqlglot's compact __reduce__ form, so the copy is identical to the original."""
+    import copyreg
+    import io
+
+    import sqlglot.expressions as exp
+
+    Expr = getattr(exp, "Expr", None) or exp.Expression
+
+    class P(pickle.Pickler):
+        def reducer_override(self, o):
+            if isinstance(o, Expr):
+                slots = {n: getattr(o, n) for n in copyreg._slotnames(type(o)) if hasattr(o, n)}
+                d = getattr(o, "__dict__", None)
+                return copyreg.__newobj__, (type(o),), (dict(d) if d is not None else None, slots or None)
+            return NotImplemented
+
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old, 100000))
+    try:
+        buf = io.BytesIO()
+        P(buf, protocol=4).dump(obj)
+        return buf.getvalue()
+    finally:
+        sys.setrecursionlimit(old)
+
+
+def _exact_loads(blob):
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old, 100000))
+    try:
+        return pickle.loads(blob)
+    finally:
+        sys.setrecursionlimit(old)
+
+
+class _Reuse:
+    """Stand-in for executor.optimize: returns the saved optimizer output when called with
+    exactly the arguments it was saved for, and calls the real optimize otherwise."""
+
+    def __init__(self, real, key, blob):
+        self.real, self.key, self.blob, self.hits = real, key, blob, 0
+
+    def __call__(self, *args, **kwargs):
+        if self.key is not None and _opt_key(args, kwargs) == self.key:
+            self.hits += 1
+            return _exact_loads(self.blob)
+        return self.real(*args, **kwargs)
+
+
+def _save_optimized(ds, mode, meta, sql, optimized, tables, data_dir, i, rec):
+    """Save the query's optimize() output and its argument digest, kept only if a full run
+    that reuses it gives exactly the record of the normal run."""
+    import sqlglot.executor as ex
+
+    real = ex.optimize
+    seen = {}
+
+    def capture(*args, **kwargs):
+        out = real(*args, **kwargs)
+        if "key" not in seen:
+            seen["key"] = _opt_key(args, kwargs)
+            seen["blob"] = _exact_dumps(out)
+        return out
+
+    try:
+        ex.optimize = capture
+        run_one(ds, mode, meta, sql, optimized, tables, compile_only=True)
+    except Exception:  # noqa: BLE001
+        return
+    finally:
+        ex.optimize = real
+    if seen.get("key") is None:
+        return
+    try:
+        rec = run_one(ds, mode, meta, sql, optimized, tables)  # untraced reference run
+    except Exception:  # noqa: BLE001
+        return
+    reuse = _Reuse(real, seen["key"], seen["blob"])
+    try:
+        ex.optimize = reuse
+        again = run_one(ds, mode, meta, sql, optimized, tables)
+    except Exception:  # noqa: BLE001
+        return
+    finally:
+        ex.optimize = real
+    if reuse.hits != 1 or again != rec:
+        if os.environ.get("BR_DEBUG_REUSE"):
+            print("reuse rejected", i, reuse.hits, [k for k in set(rec or {}) | set(again or {}) if (rec or {}).get(k) != (again or {}).get(k)], file=sys.stderr)
+        return
+    os.makedirs(os.path.join(data_dir, "snap"), exist_ok=True)
+    with open(os.path.join(data_dir, "snap", f"{i}.opt.pkl"), "wb") as f:
+        pickle.dump({"key": seen["key"], "blob": seen["blob"]}, f, protocol=4)
 
 
 def _rule_snapshots(ds, mode, meta, sql, optimized, tables, data_dir, i, unit):
