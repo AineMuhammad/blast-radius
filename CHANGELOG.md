@@ -244,3 +244,19 @@ Runtime CPU measured in-container on the samples.
   dynamic attribute access, string uses of the name, or a module that never ran.
 - Totals: samples 105.4 (unchanged), fresh 241.6 (244.3), ev80 193.5 (240.3), 150-set
   465.3 (457.7: the import-time guard). 0 misses; byte-identical runs; edge cases OK.
+- Board (16fcc16, v9.13): 154.6 s (132.352 s simulated + ~22 s CPU), 0 misses; worse than
+  v9.11, from the import-time guard.
+
+## v9.14 — renames and decorators, precise import-time guard
+- New labeled cases: renaming an untested sqlite generator method to `subquery_sql`, a
+  tested one to `subquery_sql`, an untested redshift parser method to `_parse_primary`, and
+  two controls. v9.11 missed the tested rename (it selected only the old method's testers),
+  v9.13 missed three.
+- def / class / decorator lines bind names at import time: an edit to one now also selects
+  the enclosing scope's tests (for a method: every user of the class), whether or not any
+  test ran the body.
+- The import-time guard now ignores a re-import under the same name (same object; its uses
+  are references to that name, already counted) and otherwise selects the tests that ran
+  the reading file. v9.13's version followed whole files and cost 4.6 s on the board.
+- Totals: renames 0 misses (v9.11: 1), samples 105.4, fresh 241.6, ev80 193.5, 150-set
+  451.9 (v9.11 457.7). 0 misses; byte-identical runs; edge cases OK; build_map 46 s.

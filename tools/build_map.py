@@ -542,39 +542,70 @@ def attr_readers(wkey, nm):
     return r
 
 
-_IMP_REFS = None
+_IMP_READERS = None
+GUARD = {"alias": 0, "derived": 0, "class": 0, "other": 0}
 
 
-def read_at_import(nm, f, a, b):
-    """Some line that ran at import time (module code, or function code run while importing),
-    other than lines a..b of f, references the name nm."""
-    global _IMP_REFS
-    if _IMP_REFS is None:
-        _IMP_REFS = defaultdict(set)
+def _imp_readers():
+    """name -> [(file, statement, kind)] for statements that ran at import time and
+    reference the name. kind: "alias" (import binding), "assign" (module-level assignment),
+    "class" (a class body), "other" (anything else: calls, ifs, function code run at import)."""
+    global _IMP_READERS
+    if _IMP_READERS is None:
+        _IMP_READERS = defaultdict(list)
         for g, tree in TREES.items():
             ran = set(import_lines.get(g, ())) | set(import_func_lines.get(g, ()))
             if not ran:
                 continue
+            seen = set()
             for n in ast.walk(tree):
-                ln = getattr(n, "lineno", None)
-                if ln is None:
-                    continue
                 if isinstance(n, ast.Name):
                     nm2 = n.id
                 elif isinstance(n, ast.Attribute):
                     nm2 = n.attr
                 elif isinstance(n, ast.alias):
-                    nm2 = n.asname or n.name.split(".")[-1]
-                    for ln2 in range(ln, (n.end_lineno or ln) + 1):
-                        if ln2 in ran:
-                            _IMP_REFS[n.name.split(".")[-1]].add((g, ln2))
+                    nm2 = n.name.split(".")[-1]
                 else:
                     continue
-                for ln2 in range(ln, (getattr(n, "end_lineno", None) or ln) + 1):
-                    if ln2 in ran:
-                        _IMP_REFS[nm2].add((g, ln2))
-                        break
-    return any(not (g == f and a <= ln <= b) for g, ln in _IMP_REFS.get(nm, ()))
+                ln = getattr(n, "lineno", None)
+                if ln is None or not any(l in ran for l in range(ln, (getattr(n, "end_lineno", None) or ln) + 1)):
+                    continue
+                st = _stmt_of(g, n)
+                if st is None:
+                    continue
+                fun = _func_of(g, n)
+                par = _parents(g).get(st)
+                if isinstance(n, ast.alias):
+                    kind = ("alias", n.asname or n.name.split(".")[-1])
+                elif fun is None and isinstance(par, ast.Module) and isinstance(st, (ast.Assign, ast.AnnAssign)):
+                    kind = ("assign", tuple(sorted(assigned_names(st))))
+                elif fun is None and isinstance(par, ast.ClassDef):
+                    kind = ("class", par)
+                else:
+                    kind = ("other", None)
+                key = (nm2, id(st), kind[0])
+                if key in seen:
+                    continue
+                seen.add(key)
+                _IMP_READERS[nm2].append((g, st, kind))
+    return _IMP_READERS
+
+
+def import_readers_bits(nm, f, a, b):
+    """Tests that can see a change of module-level name nm through code that ran at import
+    time and read it (other than its own statement, lines a..b of f). Re-importing it under
+    the same name binds the same object, whose later uses are references to nm (already
+    counted by name); any other reading statement counts every test that ran its file."""
+    out = 0
+    for g, st, (kind, what) in _imp_readers().get(nm, ()):
+        if g == f and a <= st.lineno <= b:
+            continue
+        if kind == "alias" and what == nm:
+            GUARD["alias"] += 1
+            continue
+        out |= file_bits(g)
+        GUARD["other"] += 1
+    return out
 
 
 def _line_names(tree):
@@ -875,10 +906,11 @@ def analyse(f):
                     else:
                         for nm in assigned_names(node):
                             bits |= nameref.get(nm, 0)
-                        if scope == "m" and any(read_at_import(nm, f, a, node.end_lineno) for nm in assigned_names(node)):
-                            # other import-time code reads it: what that code builds is used
-                            # far beyond the reading lines; every test that ran this file
-                            bits |= file_bits(f)
+                        if scope == "m":
+                            # other code that ran at import time may have read it and built
+                            # something from it: follow what that code built
+                            for nm in assigned_names(node):
+                                bits |= import_readers_bits(nm, f, a, node.end_lineno) or 0
                         if scope == "c" and any(nm.startswith("__") for nm in assigned_names(node)):
                             # dunders are used implicitly (operators, protocols): no reference
                             # line to follow, so every test that ran code in this file
@@ -1164,3 +1196,4 @@ with open(os.path.join(OUT, "index.json"), "w") as fh:
 print("tests", len(ids), "files", len(index["files"]), file=sys.stderr)
 print(f"forwarded settings: {sum(len(v) for v in SITES.values())} read sites, "
       f"{NARROWED['n']} statements narrowed, {NARROWED['dropped']} test selections dropped", file=sys.stderr)
+print(f"import-time readers followed: {GUARD}", file=sys.stderr)

@@ -296,7 +296,13 @@ def select_py(fm, hunks, flags=None, path=None):
                 if 1 <= l <= nlines:
                     bbits |= g(narrowed) if narrowed is not None else g(M[l])
             bits |= bbits
-            if rem_code or not add_txt:
+            # def / class / decorator lines run at import time and bind a name: an edit there
+            # (a rename onto a name found by dispatch, `<key>_sql`, `_parse_<x>`; a different
+            # decorator) changes what every user of the enclosing scope resolves, whether or
+            # not any test ran the old body
+            header_edit = any(t.lstrip().startswith(("def ", "async def ", "class ", "@"))
+                              for t in rem_txt + add_txt)
+            if (rem_code or not add_txt) and not header_edit:
                 # replacement: new lines run where the old ones ran
                 block_bits.append(bbits)
                 continue
@@ -305,14 +311,14 @@ def select_py(fm, hunks, flags=None, path=None):
             prev_i, next_i, encl = I[a]
             ib = bbits | g(prev_i) | g(next_i)
             ind = None
-            for t in add_txt:
+            for t in add_txt + (rem_txt if header_edit else []):
                 st = t.strip()
                 if st and not st.startswith("#"):
                     ind = len(t) - len(t.lstrip())
                     break
             inside_one = (prev_i >= 0 and prev_i == next_i and a >= 1 and M[a] == prev_i
                           and a + 1 <= nlines and M[a + 1] == next_i)
-            if ind is not None and not inside_one:
+            if ind is not None and (header_edit or not inside_one):
                 chosen = None
                 for e_ind, e_gi in encl:
                     if e_ind <= ind:
