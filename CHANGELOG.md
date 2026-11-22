@@ -152,3 +152,13 @@ Runtime CPU measured in-container on the samples.
 - 308 labeled commits: 4 crash fallbacks before, 0 after.
 - Samples 110.3 s; fresh 267.2 s (v9.1 280.4); 80 random 301.1 s; 150-set 631.2 s
   (v9.1 739.8). 0 misses everywhere; byte-identical runs; edge cases OK.
+- Board: v9 (6c0d7c7) 174.19 + 3.00 s = 177.2; v9.2 (d3a2cbb) 174.19 + 3.14 s = 177.3;
+  probe C (98af044) 438.831 s sim, 1 miss -> TPC-DS in category C costs 35.4 s, of which
+  ~14 s is unnecessary; one A/B commit wastes 21.45 s.
+
+## v9.3 — run-phase TPC checks
+- TPC model checks are costed at 0.75 x the test's tests.json seconds (measured in-process
+  ratio; a constant) and a failing check at 0.1 of that (it stops at the first mismatch), so
+  a full run-phase check runs when it is cheaper than scheduling the test.
+- 80 random 259.5 + 40.8 s (v9.2 281.0 + 21.6); 150-set 577.4 + 55.2 s (v9.2 581.0 + 54.9);
+  samples and fresh unchanged. 0 misses; byte-identical runs; edge cases OK.

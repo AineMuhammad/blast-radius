@@ -422,9 +422,12 @@ def _affects_test_config(f):
 SQLGLOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 TPC_DIR = os.environ.get("BR_TPC", "/app/tpcdata")
 HERE = os.path.dirname(os.path.abspath(__file__))  # tpc.py lives next to this file
-TPC_FACTOR = 1.0  # cost of a full model check, in units of the test's tests.json seconds
+# cost of a full model check per tests.json second of the test: in-process runs measured
+# ~0.75 (the recorded time includes the pool's start-up); a constant, so decisions do not
+# depend on this machine
+TPC_FACTOR = float(os.environ.get("BR_TPC_FACTOR", "0.75"))
 TPC_LOAD_MS_PER_MB = 25  # loading pre-parsed TPC tables
-TPC_FAIL_FRACTION = 0.25  # a broken query model stops at the first mismatch
+TPC_FAIL_FRACTION = float(os.environ.get("BR_TPC_FAIL", "0.1"))  # a broken query stops the check at the first mismatch
 # wall-clock budget for all local runs (the batch has 180 s, the final 270 s for ~1.5x commits)
 LOCAL_WALL_PER_COMMIT = 2.5
 LOCAL_WALL_MAX = 150.0
