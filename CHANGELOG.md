@@ -162,3 +162,10 @@ Runtime CPU measured in-container on the samples.
   a full run-phase check runs when it is cheaper than scheduling the test.
 - 80 random 259.5 + 40.8 s (v9.2 281.0 + 21.6); 150-set 577.4 + 55.2 s (v9.2 581.0 + 54.9);
   samples and fresh unchanged. 0 misses; byte-identical runs; edge cases OK.
+
+## v9.4 — attribute reads per TPC query; never-executed files
+- The per-query TPC profiler records class-attribute reads like the main tracer, so an
+  edit to a dialect flag that TPC queries read gets per-query bits and can be checked.
+- Files whose code never runs in the traced suite (sqlglot/__main__.py) select nothing.
+- 150-set 540.6 + 50.8 s (v9.3 577.4 + 55.0); other sets unchanged. 0 misses; edge cases
+  OK; byte-identical runs.

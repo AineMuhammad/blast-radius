@@ -731,6 +731,10 @@ def to_hex(b):
     return format(b, "x")
 
 
+NEVER_RUN = {f for f in FILES if f.startswith("sqlglot/") and f not in import_lines
+             and f not in import_func_lines and f not in cov}
+print("sqlglot files never executed:", sorted(NEVER_RUN), file=sys.stderr)
+
 os.makedirs(OUT, exist_ok=True)
 index = {"tests": ids, "files": {}, "data": {}, "dirs": {}, "testfile": {}, "heavy": {}}
 if PROFILE and os.path.exists(PROFILE):
@@ -759,6 +763,12 @@ for i, f in enumerate(FILES):
     if f not in TREES:
         continue
     M, gaps, strl, SPAN, LAMCOLS = analyse(f)
+    if f in NEVER_RUN:
+        # no code of this file ran during the whole traced suite (it is never imported):
+        # an edit to it cannot change any test
+        M = [None] * len(M)
+        gaps = [(0, 0, []) for _ in gaps]
+        LAMCOLS = {}
     groups = {}
 
     def gi(b):

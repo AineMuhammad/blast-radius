@@ -375,6 +375,54 @@ def _hook_classes():
                     pass
 
 
+# class-attribute reads per query, like tools/br_trace.py: UPPERCASE scalar attributes of
+# sqlglot's main classes record "@attr:<defining class>:<name>" into the current bucket
+_ABUCKET = [None]
+_WATCH_DONE = False
+
+
+class _Watch:
+    __slots__ = ("value", "key")
+
+    def __init__(self, value, key):
+        self.value, self.key = value, key
+
+    def __get__(self, obj, owner=None):
+        b = _ABUCKET[0]
+        if b is not None and self.key not in b:
+            b[self.key] = {0}
+        return self.value
+
+
+def _install_watchers():
+    global _WATCH_DONE
+    if _WATCH_DONE:
+        return
+    _WATCH_DONE = True
+    import sqlglot.expressions as exp
+    from sqlglot import generator, parser, tokens
+    from sqlglot.dialects.dialect import Dialect
+
+    bases = [b for b in (getattr(exp, "Expr", None), getattr(exp, "Expression", None)) if isinstance(b, type)]
+    bases += [Dialect, tokens.Tokenizer, parser.Parser, generator.Generator]
+    seen, stack = set(), list(bases)
+    scalars = (bool, int, float, str, type(None))
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        stack.extend(c.__subclasses__())
+        if not c.__module__.startswith("sqlglot"):
+            continue
+        for name, value in list(c.__dict__.items()):
+            if name.isupper() and type(value) in scalars:
+                try:
+                    setattr(c, name, _Watch(value, f"@attr:{c.__module__}.{c.__qualname__}:{name}"))
+                except (AttributeError, TypeError):
+                    pass
+
+
 def _classes(types):
     out = set()
     for t in types:
@@ -409,9 +457,11 @@ def _trace_task(args):
         global _types
         cur[0] = buckets[name] if name else None
         _types = cur[0][1] if cur[0] is not None else None
+        _ABUCKET[0] = cur[0][0] if cur[0] is not None else None
         M.restart_events()
 
     _hook_classes()
+    _install_watchers()
     if M.get_tool(5) is None:
         M.use_tool_id(5, "tpc")
     M.register_callback(5, M.events.LINE, cb)
