@@ -835,6 +835,15 @@ def code_fingerprint(co):
 
     h = hashlib.sha256()
 
+    def const(k):
+        # frozenset constants (from `x in {...}`) iterate in hash order, which differs
+        # between processes: compare them by their sorted elements
+        if isinstance(k, (frozenset, set)):
+            return ("set", tuple(sorted(repr(const(x)) for x in k)))
+        if isinstance(k, tuple):
+            return ("tuple", tuple(const(x) for x in k))
+        return (type(k).__name__, repr(k))
+
     def walk(c):
         for part in (c.co_code, c.co_exceptiontable):
             h.update(len(part).to_bytes(4, "little"))
@@ -847,7 +856,7 @@ def code_fingerprint(co):
                 h.update(b"<code>")
                 walk(k)
             else:
-                h.update(repr((type(k).__name__, k)).encode())
+                h.update(repr(const(k)).encode())
 
     walk(co)
     return h.hexdigest()

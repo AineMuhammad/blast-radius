@@ -207,3 +207,11 @@ Runtime CPU measured in-container on the samples.
 - Rule fingerprints ignore None/[] arguments (absent arguments; sqlglot's pickling drops them).
 - Same selections as v9.6 on all labeled sets; 150-set CPU 30.3 s (v9.6 40.0 s).
   0 misses; byte-identical runs; edge cases OK. Snapshots: 34 MB in the image.
+
+## v9.9 — deterministic code fingerprints
+- FIX: frozenset constants (from `x in {...}`) iterate in string-hash order, which differs
+  between processes, so files with set literals (parser.py, ...) never matched their build
+  fingerprint and the bytecode-identity rule could not fire there. Set constants are now
+  fingerprinted by their sorted elements. Identity hits on the 308 labeled commits: 29.
+- 150-set 470.9 + 30.4 s (v9.8 507.7 + 31.2), e.g. `return None` -> `return` in parser.py
+  now selects nothing. Other sets unchanged. 0 misses; byte-identical runs; edge cases OK.
