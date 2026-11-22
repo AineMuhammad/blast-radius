@@ -330,6 +330,253 @@ def can_narrow(C, names):
     return True
 
 
+# ---- forwarded settings -------------------------------------------------------------
+# Tokenizer flags (and similar) are read in one place that only hands them to a
+# constructor: `TokenizerCore(drop_unknown_escapes=self.DROP_UNKNOWN_ESCAPES, ...)`, whose
+# __init__ stores them (`self.drop_unknown_escapes = drop_unknown_escapes`). Every test that
+# builds the tokenizer reads the class attribute there, but the value can only affect a test
+# through a read of the stored attribute. forward_consumers() returns the lines where such a
+# read can happen; a test that read the class attribute only at forwarding sites and ran
+# none of those lines cannot have seen the value.
+_PARENTS = {}
+
+
+def _parents(f):
+    if f not in _PARENTS:
+        par = {}
+        for n in ast.walk(TREES[f]):
+            for c in ast.iter_child_nodes(n):
+                par[c] = n
+        _PARENTS[f] = par
+    return _PARENTS[f]
+
+
+def _stmt_of(f, node):
+    par = _parents(f)
+    while node is not None and not isinstance(node, ast.stmt):
+        node = par.get(node)
+    return node
+
+
+def _func_of(f, node):
+    par = _parents(f)
+    while node is not None and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        node = par.get(node)
+    return node
+
+
+def _span(f, node):
+    """Lines on which a read inside `node` (an expression) may be reported."""
+    st = _stmt_of(f, node)
+    if st is None:
+        return None
+    if isinstance(st, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try,
+                       ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Match)) \
+            or hasattr(ast, "TryStar") and isinstance(st, ast.TryStar):
+        return range(st.lineno, header_end(st) + 1)
+    return range(st.lineno, (st.end_lineno or st.lineno) + 1)
+
+
+SRC_PY = [f for f in TREES if f.startswith("sqlglot/")]
+_SLOT_CONSTS = None
+
+
+def _slot_consts():
+    """Constant nodes inside `__slots__ = ...` assignments (names, not dynamic accesses)."""
+    global _SLOT_CONSTS
+    if _SLOT_CONSTS is None:
+        _SLOT_CONSTS = set()
+        for f in SRC_PY:
+            for n in ast.walk(TREES[f]):
+                if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "__slots__" for t in n.targets):
+                    _SLOT_CONSTS.update(id(c) for c in ast.walk(n.value) if isinstance(c, ast.Constant))
+    return _SLOT_CONSTS
+
+
+def _dynamic_access(f, cls):
+    """getattr/setattr/hasattr/vars/__dict__ with a computed name that could reach an
+    instance of cls: anywhere in cls's own body, or outside any class in its module."""
+    for n in ast.walk(TREES[f]):
+        bad = False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "setattr", "hasattr", "delattr", "vars"):
+            bad = n.func.id == "vars" or len(n.args) < 2 or not isinstance(n.args[1], ast.Constant)
+        elif isinstance(n, ast.Attribute) and n.attr in ("__dict__", "__slots__", "__getstate__", "__reduce__", "__reduce_ex__"):
+            bad = True
+        if not bad:
+            continue
+        p = _parents(f).get(n)
+        owner = None
+        while p is not None:
+            if isinstance(p, ast.ClassDef):
+                owner = p
+                break
+            p = _parents(f).get(p)
+        if owner is None or owner is cls:
+            return True
+    return False
+
+
+_FWD = {}
+
+
+def forward_consumers(site_file, line, attr):
+    key = (site_file, line, attr)
+    if key not in _FWD:
+        try:
+            _FWD[key] = _forward_consumers(site_file, line, attr)
+        except Exception:  # noqa: BLE001
+            _FWD[key] = None
+    return _FWD[key]
+
+
+def _forward_consumers(site_file, line, attr):
+    tree = TREES.get(site_file)
+    if tree is None:
+        return None
+    par = _parents(site_file)
+    reads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == attr
+             and isinstance(n.ctx, ast.Load) and n.lineno <= line <= (n.end_lineno or n.lineno)]
+    if not reads:
+        return None
+    stored = set()
+    for r in reads:
+        kw = par.get(r)
+        call = par.get(kw)
+        if not (isinstance(kw, ast.keyword) and kw.arg and isinstance(call, ast.Call)):
+            return None
+        fn = call.func
+        cname = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+        defs = [(g, n) for g in SRC_PY for n in ast.walk(TREES[g]) if isinstance(n, ast.ClassDef) and n.name == cname]
+        if len(defs) != 1:
+            return None
+        g, cls = defs[0]
+        if _dynamic_access(g, cls) or not file_bits(g):
+            return None  # dynamic attribute access, or the module never ran (compiled)
+        if any(isinstance(b, ast.FunctionDef) and b.name in ("__getattr__", "__getattribute__") for b in cls.body):
+            return None
+        init = [b for b in cls.body if isinstance(b, ast.FunctionDef) and b.name == "__init__"]
+        if len(init) != 1:
+            return None
+        init = init[0]
+        params = {a.arg for a in init.args.args + init.args.kwonlyargs}
+        if kw.arg not in params:
+            return None
+        for n in ast.walk(init):
+            if isinstance(n, ast.Name) and n.id == kw.arg and isinstance(n.ctx, (ast.Load, ast.Del)):
+                st = par_init = _parents(g).get(n)
+                if not (isinstance(st, ast.Assign) and st.value is n and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Attribute)
+                        and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == "self"):
+                    return None
+                stored.add(st.targets[0].attr)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)) and kw.arg in n.names:
+                return None
+    if not stored:
+        return None
+    slots = _slot_consts()
+    out = defaultdict(set)
+    for a in stored:
+        for f in SRC_PY:
+            for n in ast.walk(TREES[f]):
+                if isinstance(n, ast.Constant) and n.value == a and id(n) not in slots:
+                    return None  # the name appears as a string: possibly read dynamically
+                if not (isinstance(n, ast.Attribute) and n.attr == a and isinstance(n.ctx, ast.Load)):
+                    continue
+                st = _stmt_of(f, n)
+                fun = _func_of(f, n)
+                if (isinstance(st, ast.Assign) and st.value is n and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Name) and isinstance(fun, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    alias = st.targets[0].id
+                    if any(isinstance(x, (ast.Global, ast.Nonlocal)) and alias in x.names for x in ast.walk(fun)):
+                        return None
+                    for x in ast.walk(fun):
+                        if isinstance(x, ast.Name) and x.id == alias and isinstance(x.ctx, ast.Load):
+                            sp = _span(f, x)
+                            if sp is None:
+                                return None
+                            out[f].update(sp)
+                else:
+                    sp = _span(f, n)
+                    if sp is None:
+                        return None
+                    out[f].update(sp)
+    return out
+
+
+SITES = defaultdict(list)  # "@attr:<class>:<name>" -> [(file, line, bits)]
+for _k in list(cov):
+    if _k.startswith("@attr:") and "@" in _k[1:]:
+        _base, _site = _k[1:].split("@", 1)
+        _sf, _, _sl = _site.rpartition(":")
+        SITES["@" + _base].append((_sf, int(_sl), cov[_k].get(0, 0)))
+NARROWED = {"n": 0, "dropped": 0}
+
+
+def attr_readers(wkey, nm):
+    """Tests that may see this class's value of attribute nm: readers, except those that
+    read it only at forwarding sites without running any line that reads the stored copy."""
+    w = cov.get(wkey, {}).get(0, 0)
+    sites = SITES.get(wkey)
+    if not sites:
+        return w
+    u = 0
+    for _, _, b in sites:
+        u |= b
+    if u != w:
+        return w
+    r = 0
+    for sf, sl, b in sites:
+        cons = forward_consumers(sf, sl, nm) if sf != "?" else None
+        if cons is None:
+            r |= b
+            continue
+        cb = 0
+        for f, ls in cons.items():
+            cf = cov.get(f, {})
+            for l in ls:
+                cb |= cf.get(l, 0)
+        r |= b & cb
+    if r != w:
+        NARROWED["n"] += 1
+        NARROWED["dropped"] += bin(w).count("1") - bin(r).count("1")
+    return r
+
+
+_IMP_REFS = None
+
+
+def read_at_import(nm, f, a, b):
+    """Some line that ran at import time (module code, or function code run while importing),
+    other than lines a..b of f, references the name nm."""
+    global _IMP_REFS
+    if _IMP_REFS is None:
+        _IMP_REFS = defaultdict(set)
+        for g, tree in TREES.items():
+            ran = set(import_lines.get(g, ())) | set(import_func_lines.get(g, ()))
+            if not ran:
+                continue
+            for n in ast.walk(tree):
+                ln = getattr(n, "lineno", None)
+                if ln is None:
+                    continue
+                if isinstance(n, ast.Name):
+                    nm2 = n.id
+                elif isinstance(n, ast.Attribute):
+                    nm2 = n.attr
+                elif isinstance(n, ast.alias):
+                    nm2 = n.asname or n.name.split(".")[-1]
+                    for ln2 in range(ln, (n.end_lineno or ln) + 1):
+                        if ln2 in ran:
+                            _IMP_REFS[n.name.split(".")[-1]].add((g, ln2))
+                else:
+                    continue
+                for ln2 in range(ln, (getattr(n, "end_lineno", None) or ln) + 1):
+                    if ln2 in ran:
+                        _IMP_REFS[nm2].add((g, ln2))
+                        break
+    return any(not (g == f and a <= ln <= b) for g, ln in _IMP_REFS.get(nm, ()))
+
+
 def _line_names(tree):
     """line -> names referenced on it (attribute names at the attribute's last line)."""
     out = defaultdict(set)
@@ -615,7 +862,7 @@ def analyse(f):
                             and isinstance(node, (ast.Assign, ast.AnnAssign))
                             and read_only_at_runtime(C, next(iter(names)))):
                         # the tests that read this class's definition of the attribute
-                        bits |= cov.get(wkey, {}).get(0, 0)
+                        bits |= attr_readers(wkey, next(iter(names)))
                     elif scope == "c" and is_family(C):
                         names = assigned_names(node)
                         ub = users_ext(C, f, qual)
@@ -628,6 +875,10 @@ def analyse(f):
                     else:
                         for nm in assigned_names(node):
                             bits |= nameref.get(nm, 0)
+                        if scope == "m" and any(read_at_import(nm, f, a, node.end_lineno) for nm in assigned_names(node)):
+                            # other import-time code reads it: what that code builds is used
+                            # far beyond the reading lines; every test that ran this file
+                            bits |= file_bits(f)
                         if scope == "c" and any(nm.startswith("__") for nm in assigned_names(node)):
                             # dunders are used implicitly (operators, protocols): no reference
                             # line to follow, so every test that ran code in this file
@@ -867,7 +1118,17 @@ for i, f in enumerate(FILES):
             groups[b] = len(groups)
         return groups[b]
 
-    m = [gi(b) if b is not None else -1 for b in M[: len(M) - 1]]
+    def code_gi(b):
+        # a code line that no test reaches still is code: it gets the empty group, so an edit
+        # replacing it is a replacement (runs where the old line ran: nowhere), not an
+        # insertion between its neighbours. -1 stays for lines that are not code.
+        if b == 0:
+            if 0 not in groups:
+                groups[0] = len(groups)
+            return groups[0]
+        return gi(b)
+
+    m = [code_gi(b) if b is not None else -1 for b in M[: len(M) - 1]]
     ii = []
     for prev_b, next_b, encl in gaps:
         ii.append([gi(prev_b), gi(next_b), [[ind, gi(hb)] for ind, hb in encl]])
@@ -901,3 +1162,5 @@ for k, v in test_file_bits.items():
 with open(os.path.join(OUT, "index.json"), "w") as fh:
     json.dump(index, fh, separators=(",", ":"))
 print("tests", len(ids), "files", len(index["files"]), file=sys.stderr)
+print(f"forwarded settings: {sum(len(v) for v in SITES.values())} read sites, "
+      f"{NARROWED['n']} statements narrowed, {NARROWED['dropped']} test selections dropped", file=sys.stderr)

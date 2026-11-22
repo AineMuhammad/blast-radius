@@ -165,6 +165,11 @@ class _Watch:
             s = b.get(self.key)
             if s is None:
                 b[self.key] = {0}
+            # and where it was read: "<key>@<file>:<line>" (file "?" outside the repo)
+            f = sys._getframe(1)
+            site = f"{self.key}@{_rel(f.f_code.co_filename) or '?'}:{f.f_lineno}"
+            if site not in b:
+                b[site] = {0}
         return self.value
 
 

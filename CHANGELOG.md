@@ -224,3 +224,23 @@ Runtime CPU measured in-container on the samples.
   or code that only the warm-up ran, keeps the test scheduled.
 - Totals: samples 109.6 (109.4), fresh 259.8 (261.8), ev80 291.0 (299.5), 150-set 511.1
   (521.0). 0 misses; byte-identical runs; edge cases OK; clean build 4.6 min on 4 cores.
+- Board (4c6dc81, v9.11): **150.5 s** (127.749 s simulated + 22.75 s CPU), 0 misses.
+- Board probes on v9.6: small selections -> [] gave 26 misses (26 of 29 breaking commits have
+  small selections); no TPC-DS gave 15.3 s less (only the genuinely failing commit).
+- Tried again: optimizer per-entry models (BR_OPT_MODELS=1) on top of v9.11. Simulated time
+  within 2 s, CPU +5..+23 s per set. Still off.
+
+## v9.13 — untested code lines, forwarded settings
+- FIX: a code line that no test reaches was stored like a blank line, so replacing it was
+  treated as inserting code between its neighbours and selected their tests (for a class
+  attribute, the whole class). Such lines now get an explicit empty test set.
+- New guard: a module-level assignment whose name is read by other code that ran at import
+  time selects every test that ran code in its file (the import check only proves the
+  module still imports).
+- Forwarded settings: the watcher also records where each class attribute was read. A read
+  that only passes the value as a keyword to a sqlglot class whose __init__ stores it
+  (`TokenizerCore(drop_unknown_escapes=self.DROP_UNKNOWN_ESCAPES)`) counts only for tests
+  that ran a line reading the stored copy (directly or through a local alias). Refused for
+  dynamic attribute access, string uses of the name, or a module that never ran.
+- Totals: samples 105.4 (unchanged), fresh 241.6 (244.3), ev80 193.5 (240.3), 150-set
+  465.3 (457.7: the import-time guard). 0 misses; byte-identical runs; edge cases OK.
