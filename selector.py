@@ -1034,7 +1034,17 @@ def fallback():
     sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
 
 
+def empty_probe():
+    """PROBE BUILD: run nothing for every commit. Each commit that breaks something is a
+    miss, so the board's miss count is the number of breaking commits. Not for the final."""
+    lines = [json.dumps({"commit": n[: -len(".patch")], "workers": []}, separators=(",", ":"))
+             for n in sorted(os.listdir(os.path.join(DATA, "commits"))) if n.endswith(".patch")]
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+
+
 if __name__ == "__main__":
+    empty_probe()
+    sys.exit(0)
     try:
         main()
     except BaseException as e:  # noqa: BLE001  (nothing has been written to stdout yet)
