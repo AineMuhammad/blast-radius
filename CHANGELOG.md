@@ -172,3 +172,13 @@ Runtime CPU measured in-container on the samples.
 - v9.4.1: packing breaks ties by test number. v9.4 chose identical tests on every commit
   but could order equal-duration tests differently between runs (set insertion order follows
   per-run string hashing). Now byte-identical on all four labeled sets.
+
+## v9.5 — bytecode-identical edits; local checks on multi-file commits
+- The map stores a fingerprint of each unpatched file's compiled code (bytecode, constants
+  including docstrings, names, flags; no line numbers). A patched file with the same
+  fingerprint compiles to the same program (`return None` -> `return`, parentheses, ...)
+  and is treated as untouched.
+- Commits that also modify a data file get local checks for the tests that do not read
+  it; tests reading a changed data file stay scheduled.
+- 80 random 257.1 + 41.6 s (v9.4.1 259.5 + 43.3); 150-set 507.5 + 60.0 s (540.6 + 53.4);
+  samples and fresh unchanged. 0 misses; byte-identical runs; edge cases OK.

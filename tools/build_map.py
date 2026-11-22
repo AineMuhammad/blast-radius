@@ -727,6 +727,32 @@ def analyse(f):
     return M, gaps, sorted(strlines), SPAN, LAMCOLS
 
 
+def code_fingerprint(co):
+    """Digest of a code object and everything nested in it, without line numbers or file
+    names: two sources with equal fingerprints compile to the same program."""
+    import hashlib
+    import types
+
+    h = hashlib.sha256()
+
+    def walk(c):
+        for part in (c.co_code, c.co_exceptiontable):
+            h.update(len(part).to_bytes(4, "little"))
+            h.update(part)
+        h.update(repr((c.co_name, c.co_qualname, c.co_argcount, c.co_posonlyargcount,
+                       c.co_kwonlyargcount, c.co_nlocals, c.co_stacksize, c.co_flags,
+                       c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars)).encode())
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                h.update(b"<code>")
+                walk(k)
+            else:
+                h.update(repr((type(k).__name__, k)).encode())
+
+    walk(co)
+    return h.hexdigest()
+
+
 def to_hex(b):
     return format(b, "x")
 
@@ -737,6 +763,14 @@ print("sqlglot files never executed:", sorted(NEVER_RUN), file=sys.stderr)
 
 os.makedirs(OUT, exist_ok=True)
 index = {"tests": ids, "files": {}, "data": {}, "dirs": {}, "testfile": {}, "heavy": {}}
+# fingerprints of the unpatched code: a patched file that compiles to the same program
+# (e.g. `return None` -> `return`, added parentheses) cannot change any test
+index["code"] = {}
+for f in FILES:
+    try:
+        index["code"][f] = code_fingerprint(compile(SRC[f], f, "exec", dont_inherit=True))
+    except (SyntaxError, ValueError):
+        pass
 if PROFILE and os.path.exists(PROFILE):
     pdir = os.path.dirname(PROFILE)
     for tid, v in json.load(open(PROFILE)).items():

@@ -327,7 +327,7 @@ def select_py(fm, hunks, flags=None, path=None):
     return bits
 
 
-def select(mp, patch_text, info=None):
+def select(mp, patch_text, info=None, skip=()):
     """-> bits. info (dict) gets 'files' {path: hunks} and 'local_ok' bool."""
     idx = mp.index
     bits = 0
@@ -339,12 +339,18 @@ def select(mp, patch_text, info=None):
         info["blocks"] = []  # test bits per change block of .py files
         info["data_bits"] = 0  # tests reached through non-Python files
     for f in parse_patch(patch_text):
+        if (f["old"] or f["new"]) in skip or f["old"] in skip:
+            continue  # compiles to the same program as before
         if info is not None and _affects_test_config(f):
             info["force_all"] = True
         if info is not None:
             o, nw = f["old"], f["new"]
-            if (o != nw or o in (None, "/dev/null") or f["binary"] or not o.endswith(".py")
-                    or not (o.startswith("sqlglot/") or o.startswith("tests/"))):
+            if o != nw or o in (None, "/dev/null") or f["binary"]:
+                info["local_ok"] = False
+            elif not o.endswith(".py"):
+                # a modified data file: tests that read it are kept, the rest may be checked
+                info.setdefault("data_paths", []).append(o)
+            elif not (o.startswith("sqlglot/") or o.startswith("tests/")):
                 info["local_ok"] = False
             else:
                 info["files"][o] = f["hunks"]
@@ -700,7 +706,7 @@ def pack_cost(ms_list):
     return best
 
 
-def plan_local(nums, ms, idof, extra_cost=None, extra_fail=None):
+def plan_local(nums, ms, idof, extra_cost=None, extra_fail=None, exclude=frozenset()):
     """Choose the locally-run subset maximizing expected saving.
 
     extra_cost: {test number: local CPU ms} for tests checked by a model (TPC queries)
@@ -711,6 +717,8 @@ def plan_local(nums, ms, idof, extra_cost=None, extra_fail=None):
     cand = []
     fail_cost = {}
     for n in nums:
+        if n in exclude:
+            continue  # reads a changed data file: only the real run can tell
         if n in extra_cost:
             cand.append((extra_cost[n], n))
             fail_cost[n] = extra_fail.get(n, extra_cost[n])
@@ -807,6 +815,32 @@ def tpc_plans(mp, qbits, nums, by_id, ms):
     return out
 
 
+def code_fingerprint(co):
+    """Digest of a code object and everything nested in it, without line numbers or file
+    names: two sources with equal fingerprints compile to the same program."""
+    import hashlib
+    import types
+
+    h = hashlib.sha256()
+
+    def walk(c):
+        for part in (c.co_code, c.co_exceptiontable):
+            h.update(len(part).to_bytes(4, "little"))
+            h.update(part)
+        h.update(repr((c.co_name, c.co_qualname, c.co_argcount, c.co_posonlyargcount,
+                       c.co_kwonlyargcount, c.co_nlocals, c.co_stacksize, c.co_flags,
+                       c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars)).encode())
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                h.update(b"<code>")
+                walk(k)
+            else:
+                h.update(repr((type(k).__name__, k)).encode())
+
+    walk(co)
+    return h.hexdigest()
+
+
 def patched_sources(info):
     """New full text of every patched .py file. -> (dict, problem or None)."""
     patched = {}
@@ -819,10 +853,11 @@ def patched_sources(info):
         if new is None:
             return None, None  # does not apply to the pinned tree: no local work
         try:
-            compile(new, path, "exec", dont_inherit=True)
+            co = compile(new, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError) as e:
             return patched, f"{path} does not compile: {e!r}"[:200]
         patched[path] = new
+        info.setdefault("fingerprints", {})[path] = code_fingerprint(co)
     return patched, None
 
 
@@ -878,8 +913,11 @@ def refine_local(info, nums, ms, idof, tpc=None, patched=None, allow_tests=True,
     tpc = tpc or {}
     if any(p.startswith("tests/") for p in info["files"]):
         tpc = {}  # item models mirror the unpatched test code
-    L = plan_local(nums, ms, idof, {n: v[2] for n, v in tpc.items()},
-                   {n: TPC_FAIL_FRACTION * v[2] for n, v in tpc.items()}) if allow_tests else []
+    data_bits = info.get("data_bits", 0)
+    exclude = {n for n in nums if num_bit and n in num_bit and (data_bits >> num_bit[n]) & 1}
+    L = plan_local(nums, ms, idof, {n: v[2] for n, v in tpc.items() if n not in exclude},
+                   {n: TPC_FAIL_FRACTION * v[2] for n, v in tpc.items() if n not in exclude},
+                   exclude) if allow_tests else []
     sentinels = sentinel_plan(info, nums, ms, idof, num_bit or {}, set(L), tpc, total_bits) if allow_tests else {}
     if sentinels:
         extra = set().union(*sentinels.values()) - set(L)
@@ -951,6 +989,28 @@ def main():
 
     idof = {t["number"]: t["id"] for t in tests}
     num_bit = {n: i for i, n in enumerate(bit2num) if n is not None}
+
+    def decode(bits):
+        nums = set(always)
+        qbits = {}
+        i = 0
+        while bits:
+            if bits & 1:
+                nm = bit2num[i]
+                if nm is not None:
+                    nums.add(nm)
+                elif i in pseudo:
+                    tid, q, run = pseudo[i]
+                    e = qbits.setdefault(tid, {"q": set(), "run": set(), "bad": False})
+                    if q is None:
+                        e["bad"] = True
+                    elif run:
+                        e["run"].add(q)
+                    else:
+                        e["q"].add(q)
+            bits >>= 1
+            i += 1
+        return nums, qbits
     import time
 
     local_enabled = os.environ.get("BR_LOCAL", "1") == "1" and os.path.isdir(SQLGLOT)
@@ -972,25 +1032,7 @@ def main():
                 text = f.read()
             bits = select(mp, text, info)
             total_bits = bits
-            nums = set(always)
-            qbits = {}
-            i = 0
-            while bits:
-                if bits & 1:
-                    nm = bit2num[i]
-                    if nm is not None:
-                        nums.add(nm)
-                    elif i in pseudo:
-                        tid, q, run = pseudo[i]
-                        e = qbits.setdefault(tid, {"q": set(), "run": set(), "bad": False})
-                        if q is None:
-                            e["bad"] = True
-                        elif run:
-                            e["run"].add(q)
-                        else:
-                            e["q"].add(q)
-                bits >>= 1
-                i += 1
+            nums, qbits = decode(bits)
         except Exception as e:  # never fail: run everything
             log(f"{cid}: error {e!r}, selecting all")
             nums = set(ms)
@@ -1003,6 +1045,20 @@ def main():
             except Exception as e:  # noqa: BLE001
                 patched, problem = None, None
                 log(f"{cid}: could not rebuild patched sources ({e!r})")
+            same = {p for p, fp in info.get("fingerprints", {}).items()
+                    if not problem and mp.index.get("code", {}).get(p) == fp}
+            if same:
+                # these files compile to exactly the same program: select as if untouched
+                try:
+                    info2 = {}
+                    bits = select(mp, text, info2, skip=same)
+                    total_bits = bits
+                    nums, qbits = decode(bits)
+                    info2["fingerprints"] = info.get("fingerprints", {})
+                    info = info2
+                    log(f"{cid}: {sorted(same)} compile to the unpatched program")
+                except Exception as e:  # noqa: BLE001
+                    log(f"{cid}: re-selection failed ({e!r}), keeping the full selection")
             if problem:
                 log(f"{cid}: {problem}; selecting all")
                 nums = set(ms)
