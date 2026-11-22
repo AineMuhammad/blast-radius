@@ -772,6 +772,8 @@ for i, f in enumerate(FILES):
     ii = []
     for prev_b, next_b, encl in gaps:
         ii.append([gi(prev_b), gi(next_b), [[ind, gi(hb)] for ind, hb in encl]])
+    # register the lambda groups before "g" is serialized: they index into it
+    lam_out = {str(l): [[c0, c1, gi(lb)] for _, c0, c1, lb in sorted(v)] for l, v in LAMCOLS.items()}
     name = f"f{i}.json"
     with open(os.path.join(OUT, name), "w") as fh:
         json.dump(
@@ -779,10 +781,16 @@ for i, f in enumerate(FILES):
              # lines of statements that run at import time (module / class bodies, not lambdas)
              "t": [l for l in range(1, len(M) - 1) if M[l] is not None and SPAN[l] is None],
              # line -> [[col_start, col_end, group], ...] of lambda bodies, innermost first
-             "lam": {str(l): [[c0, c1, gi(lb)] for _, c0, c1, lb in sorted(v)] for l, v in LAMCOLS.items()}},
+             "lam": lam_out},
             fh,
             separators=(",", ":"),
         )
+    ng = len(groups)
+    refs = [x for x in m if x >= 0] + [x for p_, n_, e_ in ii for x in (p_, n_) if x >= 0]
+    refs += [x for _, e_ in [(0, e) for p_, n_, e in ii] for _, x in e_ if x >= 0]
+    refs += [x for v in lam_out.values() for _, _, x in v if x >= 0]
+    if any(x >= ng for x in refs):
+        sys.exit(f"{f}: map refers to a missing test group")
     index["files"][f] = name
 
 for k, v in data_files.items():

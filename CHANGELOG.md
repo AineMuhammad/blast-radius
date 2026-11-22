@@ -141,3 +141,14 @@ Runtime CPU measured in-container on the samples.
   150-set 682.8 + 39.6 s. 0 misses everywhere; byte-identical runs; edge cases OK.
 - Probes with a 100 s CPU burn (can never become our best score):
   probe-no-tpcds cf92b43, probe-no-long-tests 7de20ae.
+- Board (TPC-DS probe on 23e305c): 417.377 s simulated with 1 miss -> 117.4 s without the
+  penalty; TPC-DS costs ~56.8 s on the board (~22 s on the commit that breaks it).
+
+## v9.2 — lambda-edit crash fix
+- FIX: the map builder assigned the lambda-body groups after the file's group list had been
+  serialized, so their indices pointed past it. Every one-line edit inside a lambda in a
+  class/module-level table raised IndexError in the selector, whose safety net then selected
+  the whole suite. Since v6. The build now fails if a map refers to a missing group.
+- 308 labeled commits: 4 crash fallbacks before, 0 after.
+- Samples 110.3 s; fresh 267.2 s (v9.1 280.4); 80 random 301.1 s; 150-set 631.2 s
+  (v9.1 739.8). 0 misses everywhere; byte-identical runs; edge cases OK.
